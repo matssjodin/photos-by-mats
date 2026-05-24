@@ -19,7 +19,7 @@ On startup, the server ensures the account from `ADMIN_EMAIL` and `ADMIN_PASSWOR
 
 ## Coolify Deployment
 
-Deploy this repository as a Docker app and set these environment variables:
+Deploy this repository as a Docker app. The database is embedded in the container as SQLite, so you do not need to add a separate database service.
 
 ```bash
 PORT=4000
@@ -29,7 +29,29 @@ ADMIN_EMAIL=<your admin email>
 ADMIN_PASSWORD=<your first admin password>
 ```
 
-Mount persistent storage to `/app/data`. Originals, generated previews, thumbnails, and the SQLite database all live there.
+Mount persistent storage to `/app/data`. Originals, generated previews, thumbnails, and the SQLite database file all live there:
+
+```text
+/app/data/photos.sqlite
+/app/data/uploads/
+```
+
+Do not deploy without persistent storage unless you are okay with losing all users, albums, and photos when the container is recreated.
+
+## Docker Compose
+
+You can also run the whole app, including its embedded SQLite database, with Docker Compose:
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+For Docker or Coolify, use Docker-style paths in `.env`:
+
+```bash
+DATA_DIR=/app/data
+```
 
 There is no public sign-up route. New users are created from the in-app Admin screen.
 

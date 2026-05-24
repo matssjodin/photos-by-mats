@@ -1,0 +1,9 @@
+node_modules
+dist-client
+dist-server
+data
+tmp-admin-test
+.git
+.env
+server*.log
+npm-debug.log*

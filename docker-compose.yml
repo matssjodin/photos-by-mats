@@ -1,0 +1,18 @@
+services:
+  sjodinphotos:
+    build: .
+    image: sjodinphotos:latest
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: "4000"
+      DATA_DIR: /app/data
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:?set ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
+    volumes:
+      - sjodinphotos-data:/app/data
+
+volumes:
+  sjodinphotos-data:
