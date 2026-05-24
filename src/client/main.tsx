@@ -1,0 +1,1025 @@
+import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  Archive,
+  Camera,
+  ChevronLeft,
+  ChevronRight,
+  Heart,
+  ImagePlus,
+  Images,
+  Info,
+  LogOut,
+  Plus,
+  Search,
+  Shield,
+  Sparkles,
+  Star,
+  Trash2,
+  UserPlus,
+  Users,
+  X
+} from "lucide-react";
+import "./styles.css";
+
+type Role = "admin" | "user";
+type View = "photos" | "favorites" | "albums" | "archive" | "trash" | "admin";
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+  role: Role;
+  disabled: boolean;
+  createdAt: string;
+};
+
+type Asset = {
+  id: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number;
+  width: number | null;
+  height: number | null;
+  takenAt: string;
+  createdAt: string;
+  favorite: boolean;
+  archived: boolean;
+  trashed: boolean;
+  urls: {
+    thumb: string;
+    preview: string;
+    original: string | null;
+  };
+};
+
+type Album = {
+  id: string;
+  title: string;
+  createdAt: string;
+  assetCount: number;
+  coverAssetId: string | null;
+  shareToken: string | null;
+  shareUrl: string | null;
+};
+
+const navItems = [
+  { id: "photos", label: "Photos", icon: Images },
+  { id: "favorites", label: "Favorites", icon: Heart },
+  { id: "albums", label: "Albums", icon: Star },
+  { id: "archive", label: "Archive", icon: Archive },
+  { id: "trash", label: "Trash", icon: Trash2 }
+] as const;
+
+function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [booting, setBooting] = useState(true);
+  const shareToken = window.location.pathname.startsWith("/share/")
+    ? window.location.pathname.split("/").filter(Boolean)[1]
+    : null;
+
+  useEffect(() => {
+    if (shareToken) {
+      setBooting(false);
+      return;
+    }
+    api<{ user: User }>("/api/me")
+      .then((data) => setUser(data.user))
+      .catch(() => setUser(null))
+      .finally(() => setBooting(false));
+  }, [shareToken]);
+
+  if (booting) return <Splash />;
+  if (shareToken) return <SharedAlbum token={shareToken} />;
+  if (!user) return <Login onLogin={setUser} />;
+  return <PhotosApp user={user} onLogout={() => setUser(null)} />;
+}
+
+function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
+  const [view, setView] = useState<View>("photos");
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [albums, setAlbums] = useState<Album[]>([]);
+  const [activeAlbum, setActiveAlbum] = useState<Album | null>(null);
+  const [selected, setSelected] = useState<Asset | null>(null);
+  const [search, setSearch] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [dragging, setDragging] = useState(false);
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [libraryAssets, setLibraryAssets] = useState<Asset[]>([]);
+  const fileInput = useRef<HTMLInputElement | null>(null);
+
+  const visibleAssets = useMemo(() => {
+    if (!search.trim() || activeAlbum) return assets;
+    const query = search.toLowerCase();
+    return assets.filter((asset) =>
+      asset.originalName.toLowerCase().includes(query) ||
+      prettyDate(asset.takenAt).toLowerCase().includes(query)
+    );
+  }, [assets, search, activeAlbum]);
+
+  useEffect(() => {
+    if (view === "admin") return;
+    if (view === "albums") {
+      loadAlbums();
+      if (!activeAlbum) return;
+      loadAlbumAssets(activeAlbum.id);
+      return;
+    }
+    setActiveAlbum(null);
+    loadAssets(view);
+  }, [view, activeAlbum?.id]);
+
+  async function loadAssets(nextView = view) {
+    setBusy(true);
+    try {
+      const data = await api<{ assets: Asset[] }>(`/api/assets?view=${nextView}&q=${encodeURIComponent(search)}`);
+      setAssets(data.assets);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadAlbums() {
+    const data = await api<{ albums: Album[] }>("/api/albums");
+    setAlbums(data.albums);
+  }
+
+  async function loadAlbumAssets(albumId: string) {
+    setBusy(true);
+    try {
+      const data = await api<{ assets: Asset[] }>(`/api/albums/${albumId}/assets`);
+      setAssets(data.assets);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function uploadPhotos(files: FileList | File[] | null, albumId = activeAlbum?.id) {
+    if (!files?.length) return;
+    const form = new FormData();
+    Array.from(files).forEach((file) => form.append("photos", file));
+    setBusy(true);
+    setMessage("Uploading");
+    try {
+      const endpoint = albumId ? `/api/albums/${albumId}/upload` : "/api/assets";
+      const response = await fetch(endpoint, { method: "POST", body: form });
+      if (!response.ok) throw new Error((await response.json()).error ?? "Upload failed.");
+      setMessage("");
+      if (albumId) {
+        await loadAlbumAssets(albumId);
+        await loadAlbums();
+      } else {
+        await loadAssets("photos");
+        setView("photos");
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Upload failed.");
+    } finally {
+      setBusy(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  }
+
+  async function mutateAsset(asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) {
+    const data = await api<{ asset: Asset }>(`/api/assets/${asset.id}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch)
+    });
+    setSelected((current) => current?.id === data.asset.id ? data.asset : current);
+    setAssets((current) => current.map((item) => item.id === data.asset.id ? data.asset : item));
+    if (view !== "photos") await loadAssets(view);
+  }
+
+  async function deleteAsset(asset: Asset) {
+    await api(`/api/assets/${asset.id}`, { method: "DELETE" });
+    setSelected(null);
+    setAssets((current) => current.filter((item) => item.id !== asset.id));
+  }
+
+  async function createAlbum(title: string, files?: FileList | File[] | null) {
+    const data = await api<{ album: Album }>("/api/albums", {
+      method: "POST",
+      body: JSON.stringify({ title })
+    });
+    setAlbums((current) => [data.album, ...current]);
+    setActiveAlbum(data.album);
+    if (files?.length) {
+      await uploadPhotos(files, data.album.id);
+    } else {
+      setAssets([]);
+    }
+    return data.album;
+  }
+
+  async function addToAlbum(albumId: string, assetIds: string[] | string) {
+    const ids = Array.isArray(assetIds) ? assetIds : [assetIds];
+    await api(`/api/albums/${albumId}/assets`, {
+      method: "POST",
+      body: JSON.stringify({ assetIds: ids })
+    });
+    await loadAlbums();
+    if (activeAlbum?.id === albumId) await loadAlbumAssets(albumId);
+  }
+
+  async function openAddModal() {
+    const data = await api<{ assets: Asset[] }>("/api/assets?view=photos");
+    setLibraryAssets(data.assets);
+    setAddModalOpen(true);
+  }
+
+  async function shareAlbum(album: Album) {
+    const data = await api<{ album: Album }>(`/api/albums/${album.id}/share`, { method: "POST" });
+    setAlbums((current) => current.map((item) => item.id === data.album.id ? data.album : item));
+    setActiveAlbum((current) => current?.id === data.album.id ? data.album : current);
+    const absoluteUrl = `${window.location.origin}${data.album.shareUrl}`;
+    await navigator.clipboard?.writeText(absoluteUrl).catch(() => undefined);
+    setMessage("Share link copied");
+  }
+
+  function handleDrop(event: React.DragEvent<HTMLElement>) {
+    event.preventDefault();
+    setDragging(false);
+    void uploadPhotos(event.dataTransfer.files, activeAlbum?.id);
+  }
+
+  async function logout() {
+    await api("/api/auth/logout", { method: "POST" });
+    onLogout();
+  }
+
+  const title = activeAlbum ? activeAlbum.title : view === "photos" ? "Photos" : labelFor(view);
+  const showLibraryTools = view !== "admin" && !(view === "albums" && !activeAlbum);
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark"><Camera size={22} /></div>
+          <span>Sjodin Photos</span>
+        </div>
+        <nav className="nav-list">
+          {navItems.map((item) => (
+            <button
+              className={view === item.id ? "nav-item active" : "nav-item"}
+              key={item.id}
+              onClick={() => setView(item.id)}
+              type="button"
+            >
+              <item.icon size={19} />
+              <span>{item.label}</span>
+            </button>
+          ))}
+          {user.role === "admin" && (
+            <button
+              className={view === "admin" ? "nav-item active" : "nav-item"}
+              onClick={() => setView("admin")}
+              type="button"
+            >
+              <Shield size={19} />
+              <span>Admin</span>
+            </button>
+          )}
+        </nav>
+        <div className="account-strip">
+          <div>
+            <strong>{user.name}</strong>
+            <span>{user.email}</span>
+          </div>
+          <button className="icon-button" onClick={logout} title="Log out" type="button">
+            <LogOut size={18} />
+          </button>
+        </div>
+      </aside>
+
+      <main className="main">
+        <header className="topbar">
+          <div>
+            {showLibraryTools && (
+              <p className="eyebrow">{visibleAssets.length} item{visibleAssets.length === 1 ? "" : "s"}</p>
+            )}
+            <h1>{title}</h1>
+          </div>
+          <div className="toolbar">
+            {showLibraryTools && (
+              <label className="search-field">
+                <Search size={18} />
+                <input
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") void loadAssets(view);
+                  }}
+                  placeholder="Search"
+                />
+              </label>
+            )}
+            {showLibraryTools && (
+              <button className="primary-button" onClick={() => fileInput.current?.click()} type="button">
+                <ImagePlus size={18} />
+                <span>Upload</span>
+              </button>
+            )}
+            <input
+              ref={fileInput}
+              className="hidden-input"
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={(event) => void uploadPhotos(event.target.files)}
+            />
+          </div>
+        </header>
+
+        {message && <div className="toast">{message}</div>}
+        {view === "admin" ? (
+          <AdminPanel currentUser={user} />
+        ) : view === "albums" && !activeAlbum ? (
+          <AlbumsView albums={albums} onCreate={createAlbum} onOpen={setActiveAlbum} onShare={shareAlbum} />
+        ) : (
+          <DropArea dragging={dragging} onDragChange={setDragging} onDrop={handleDrop}>
+            <LibraryView
+              activeAlbum={activeAlbum}
+              assets={visibleAssets}
+              busy={busy}
+              onAddExisting={openAddModal}
+              onBack={() => setActiveAlbum(null)}
+              onSelect={setSelected}
+              onShare={shareAlbum}
+              onUpload={() => fileInput.current?.click()}
+            />
+          </DropArea>
+        )}
+      </main>
+
+      {addModalOpen && activeAlbum && (
+        <AddExistingModal
+          album={activeAlbum}
+          albumAssets={assets}
+          assets={libraryAssets}
+          onAdd={(ids) => addToAlbum(activeAlbum.id, ids)}
+          onClose={() => setAddModalOpen(false)}
+        />
+      )}
+
+      {selected && (
+        <Viewer
+          albums={albums}
+          asset={selected}
+          assets={visibleAssets}
+          onAddToAlbum={addToAlbum}
+          onClose={() => setSelected(null)}
+          onDelete={deleteAsset}
+          onMutate={mutateAsset}
+          onSelect={setSelected}
+        />
+      )}
+    </div>
+  );
+}
+
+function Login({ onLogin }: { onLogin: (user: User) => void }) {
+  const [email, setEmail] = useState("admin@example.com");
+  const [password, setPassword] = useState("change-me-before-deploy");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const data = await api<{ user: User }>("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password })
+      });
+      onLogin(data.user);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="login-page">
+      <form className="login-panel" onSubmit={submit}>
+        <div className="brand login-brand">
+          <div className="brand-mark"><Camera size={24} /></div>
+          <span>Sjodin Photos</span>
+        </div>
+        <h1>Welcome back</h1>
+        <label>
+          Email
+          <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoComplete="email" />
+        </label>
+        <label>
+          Password
+          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" />
+        </label>
+        {error && <p className="form-error">{error}</p>}
+        <button className="primary-button wide" disabled={busy} type="submit">
+          <Sparkles size={18} />
+          <span>{busy ? "Signing in" : "Sign in"}</span>
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function SharedAlbum({ token }: { token: string }) {
+  const [album, setAlbum] = useState<Album | null>(null);
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [selected, setSelected] = useState<Asset | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    api<{ album: Album; assets: Asset[] }>(`/api/share/${token}`)
+      .then((data) => {
+        setAlbum(data.album);
+        setAssets(data.assets);
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : "Shared album not found."));
+  }, [token]);
+
+  if (error) {
+    return (
+      <section className="shared-page">
+        <div className="empty-state">
+          <div className="empty-icon"><Images size={38} /></div>
+          <h2>{error}</h2>
+        </div>
+      </section>
+    );
+  }
+
+  if (!album) return <Splash />;
+
+  return (
+    <section className="shared-page">
+      <header className="shared-header">
+        <div className="brand">
+          <div className="brand-mark"><Camera size={22} /></div>
+          <span>Sjodin Photos</span>
+        </div>
+        <div>
+          <p className="eyebrow">{assets.length} item{assets.length === 1 ? "" : "s"}</p>
+          <h1>{album.title}</h1>
+        </div>
+      </header>
+      {assets.length ? (
+        <LibraryView
+          activeAlbum={null}
+          assets={assets}
+          busy={false}
+          onAddExisting={() => undefined}
+          onBack={() => undefined}
+          onSelect={setSelected}
+          onShare={async () => undefined}
+          onUpload={() => undefined}
+        />
+      ) : (
+        <div className="empty-state">
+          <div className="empty-icon"><Images size={38} /></div>
+          <h2>No photos in this shared album</h2>
+        </div>
+      )}
+      {selected && (
+        <SharedViewer asset={selected} assets={assets} onClose={() => setSelected(null)} onSelect={setSelected} />
+      )}
+    </section>
+  );
+}
+
+function SharedViewer({
+  asset,
+  assets,
+  onClose,
+  onSelect
+}: {
+  asset: Asset;
+  assets: Asset[];
+  onClose: () => void;
+  onSelect: (asset: Asset) => void;
+}) {
+  const index = assets.findIndex((item) => item.id === asset.id);
+  const previous = index > 0 ? assets[index - 1] : null;
+  const next = index >= 0 && index < assets.length - 1 ? assets[index + 1] : null;
+
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft" && previous) onSelect(previous);
+      if (event.key === "ArrowRight" && next) onSelect(next);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [next, previous, onClose, onSelect]);
+
+  return (
+    <div className="viewer">
+      <div className="viewer-toolbar">
+        <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
+      </div>
+      {previous && <button className="viewer-nav previous" onClick={() => onSelect(previous)} type="button"><ChevronLeft size={28} /></button>}
+      <img className="viewer-image public" src={asset.urls.preview} alt={asset.originalName} />
+      {next && <button className="viewer-nav next public" onClick={() => onSelect(next)} type="button"><ChevronRight size={28} /></button>}
+    </div>
+  );
+}
+
+function LibraryView({
+  activeAlbum,
+  assets,
+  busy,
+  onAddExisting,
+  onBack,
+  onSelect,
+  onShare,
+  onUpload
+}: {
+  activeAlbum: Album | null;
+  assets: Asset[];
+  busy: boolean;
+  onAddExisting: () => void;
+  onBack: () => void;
+  onSelect: (asset: Asset) => void;
+  onShare: (album: Album) => Promise<void>;
+  onUpload: () => void;
+}) {
+  if (busy && assets.length === 0) return <GridSkeleton />;
+
+  if (!assets.length) {
+    return (
+      <section className="empty-state">
+        {activeAlbum && (
+          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onShare={onShare} onUpload={onUpload} />
+        )}
+        <div className="empty-icon"><Images size={38} /></div>
+        <h2>No photos here</h2>
+        <button className="primary-button" onClick={onUpload} type="button">
+          <ImagePlus size={18} />
+          <span>Upload</span>
+        </button>
+      </section>
+    );
+  }
+
+  return (
+    <section className="library">
+      {activeAlbum && (
+        <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onShare={onShare} onUpload={onUpload} />
+      )}
+      {groupAssets(assets).map((group) => (
+        <div className="date-group" key={group.label}>
+          <h2>{group.label}</h2>
+          <div className="photo-grid">
+            {group.assets.map((asset) => (
+              <button className="photo-tile" key={asset.id} onClick={() => onSelect(asset)} type="button">
+                <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" />
+                {asset.favorite && <span className="tile-badge"><Heart size={14} fill="currentColor" /></span>}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function DropArea({
+  children,
+  dragging,
+  onDragChange,
+  onDrop
+}: {
+  children: React.ReactNode;
+  dragging: boolean;
+  onDragChange: (dragging: boolean) => void;
+  onDrop: (event: React.DragEvent<HTMLElement>) => void;
+}) {
+  return (
+    <section
+      className={dragging ? "drop-area dragging" : "drop-area"}
+      onDragEnter={(event) => {
+        event.preventDefault();
+        onDragChange(true);
+      }}
+      onDragOver={(event) => event.preventDefault()}
+      onDragLeave={(event) => {
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        onDragChange(false);
+      }}
+      onDrop={onDrop}
+    >
+      {children}
+      {dragging && (
+        <div className="drop-overlay">
+          <ImagePlus size={36} />
+          <strong>Drop photos to upload</strong>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AlbumActionBar({
+  album,
+  onAddExisting,
+  onBack,
+  onShare,
+  onUpload
+}: {
+  album: Album;
+  onAddExisting: () => void;
+  onBack: () => void;
+  onShare: (album: Album) => Promise<void>;
+  onUpload: () => void;
+}) {
+  return (
+    <div className="album-actions">
+      <button className="text-button" onClick={onBack} type="button">
+        <ChevronLeft size={18} /> Albums
+      </button>
+      <div>
+        <button className="secondary-button" onClick={onAddExisting} type="button">
+          <Images size={18} />
+          <span>Add existing</span>
+        </button>
+        <button className="secondary-button" onClick={onUpload} type="button">
+          <ImagePlus size={18} />
+          <span>Upload here</span>
+        </button>
+        <button className="primary-button" onClick={() => void onShare(album)} type="button">
+          <Sparkles size={18} />
+          <span>{album.shareUrl ? "Copy share link" : "Create share link"}</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AlbumsView({
+  albums,
+  onCreate,
+  onOpen,
+  onShare
+}: {
+  albums: Album[];
+  onCreate: (title: string, files?: FileList | null) => Promise<Album>;
+  onOpen: (album: Album) => void;
+  onShare: (album: Album) => Promise<void>;
+}) {
+  const [title, setTitle] = useState("");
+  const [files, setFiles] = useState<FileList | null>(null);
+  const inputId = useId();
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!title.trim()) return;
+    await onCreate(title.trim(), files);
+    setTitle("");
+    setFiles(null);
+  }
+
+  return (
+    <section className="albums-layout">
+      <form className="album-create" onSubmit={submit}>
+        <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="New album" />
+        <label className="secondary-button album-file-picker" htmlFor={inputId}>
+          <ImagePlus size={18} />
+          <span>{files?.length ? `${files.length} selected` : "Photos"}</span>
+        </label>
+        <input id={inputId} className="hidden-input" type="file" accept="image/*" multiple onChange={(event) => setFiles(event.target.files)} />
+        <button className="primary-button" type="submit"><Plus size={18} /><span>Create</span></button>
+      </form>
+      <div className="album-grid">
+        {albums.map((album) => (
+          <div className="album-tile" key={album.id}>
+            <button className="album-open" onClick={() => onOpen(album)} type="button">
+              <div className="album-art"><Images size={32} /></div>
+              <strong>{album.title}</strong>
+              <span>{album.assetCount ?? 0} item{album.assetCount === 1 ? "" : "s"}</span>
+            </button>
+            <button className="icon-button" onClick={() => void onShare(album)} title="Share album" type="button">
+              <Sparkles size={18} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AddExistingModal({
+  album,
+  albumAssets,
+  assets,
+  onAdd,
+  onClose
+}: {
+  album: Album;
+  albumAssets: Asset[];
+  assets: Asset[];
+  onAdd: (assetIds: string[]) => Promise<void>;
+  onClose: () => void;
+}) {
+  const existingIds = useMemo(() => new Set(albumAssets.map((asset) => asset.id)), [albumAssets]);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const candidates = assets.filter((asset) => !existingIds.has(asset.id));
+
+  async function submit() {
+    if (!selectedIds.length) return;
+    await onAdd(selectedIds);
+    onClose();
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <section className="modal">
+        <div className="modal-head">
+          <div>
+            <p className="eyebrow">{candidates.length} available</p>
+            <h2>Add to {album.title}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} title="Close" type="button"><X size={18} /></button>
+        </div>
+        {candidates.length ? (
+          <div className="picker-grid">
+            {candidates.map((asset) => {
+              const checked = selectedIds.includes(asset.id);
+              return (
+                <button
+                  className={checked ? "picker-tile selected" : "picker-tile"}
+                  key={asset.id}
+                  onClick={() => setSelectedIds((current) => checked ? current.filter((id) => id !== asset.id) : [...current, asset.id])}
+                  type="button"
+                >
+                  <img src={asset.urls.thumb} alt={asset.originalName} />
+                  <span>{checked ? "Selected" : asset.originalName}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="empty-inline">Every available photo is already in this album.</div>
+        )}
+        <div className="modal-actions">
+          <button className="secondary-button" onClick={onClose} type="button">Cancel</button>
+          <button className="primary-button" disabled={!selectedIds.length} onClick={() => void submit()} type="button">
+            Add {selectedIds.length || ""}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function Viewer({
+  albums,
+  asset,
+  assets,
+  onAddToAlbum,
+  onClose,
+  onDelete,
+  onMutate,
+  onSelect
+}: {
+  albums: Album[];
+  asset: Asset;
+  assets: Asset[];
+  onAddToAlbum: (albumId: string, assetId: string) => Promise<void>;
+  onClose: () => void;
+  onDelete: (asset: Asset) => Promise<void>;
+  onMutate: (asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) => Promise<void>;
+  onSelect: (asset: Asset) => void;
+}) {
+  const [showInfo, setShowInfo] = useState(true);
+  const index = assets.findIndex((item) => item.id === asset.id);
+  const previous = index > 0 ? assets[index - 1] : null;
+  const next = index >= 0 && index < assets.length - 1 ? assets[index + 1] : null;
+
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft" && previous) onSelect(previous);
+      if (event.key === "ArrowRight" && next) onSelect(next);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [next, previous, onClose, onSelect]);
+
+  return (
+    <div className="viewer">
+      <div className="viewer-toolbar">
+        <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
+        <div className="viewer-actions">
+          <button className={asset.favorite ? "icon-button light active" : "icon-button light"} onClick={() => void onMutate(asset, { favorite: !asset.favorite })} title="Favorite" type="button"><Heart size={20} /></button>
+          <button className="icon-button light" onClick={() => void onMutate(asset, { archived: !asset.archived })} title="Archive" type="button"><Archive size={20} /></button>
+          <button className="icon-button light" onClick={() => void onMutate(asset, { trashed: !asset.trashed })} title="Trash" type="button"><Trash2 size={20} /></button>
+          <button className={showInfo ? "icon-button light active" : "icon-button light"} onClick={() => setShowInfo(!showInfo)} title="Info" type="button"><Info size={20} /></button>
+        </div>
+      </div>
+      {previous && <button className="viewer-nav previous" onClick={() => onSelect(previous)} type="button"><ChevronLeft size={28} /></button>}
+      <img className="viewer-image" src={asset.urls.preview} alt={asset.originalName} />
+      {next && <button className="viewer-nav next" onClick={() => onSelect(next)} type="button"><ChevronRight size={28} /></button>}
+      {showInfo && (
+        <aside className="info-panel">
+          <h2>{asset.originalName}</h2>
+          <dl>
+            <div><dt>Date</dt><dd>{prettyDate(asset.takenAt)}</dd></div>
+            <div><dt>Size</dt><dd>{formatBytes(asset.sizeBytes)}</dd></div>
+            <div><dt>Dimensions</dt><dd>{asset.width && asset.height ? `${asset.width} x ${asset.height}` : "Unknown"}</dd></div>
+            <div><dt>Type</dt><dd>{asset.mimeType}</dd></div>
+          </dl>
+          <div className="info-actions">
+            {asset.urls.original && (
+              <a className="secondary-button" href={asset.urls.original} target="_blank" rel="noreferrer">Original</a>
+            )}
+            {asset.trashed ? (
+              <button className="danger-button" onClick={() => void onDelete(asset)} type="button">Delete permanently</button>
+            ) : (
+              <button className="secondary-button" onClick={() => void onMutate(asset, { trashed: true })} type="button">Move to trash</button>
+            )}
+          </div>
+          {!!albums.length && (
+            <div className="album-pick">
+              <span>Add to album</span>
+              {albums.map((album) => (
+                <button key={album.id} onClick={() => void onAddToAlbum(album.id, asset.id)} type="button">{album.title}</button>
+              ))}
+            </div>
+          )}
+        </aside>
+      )}
+    </div>
+  );
+}
+
+function AdminPanel({ currentUser }: { currentUser: User }) {
+  const [users, setUsers] = useState<User[]>([]);
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState<Role>("user");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void loadUsers();
+  }, []);
+
+  async function loadUsers() {
+    const data = await api<{ users: User[] }>("/api/admin/users");
+    setUsers(data.users);
+  }
+
+  async function createUser(event: React.FormEvent) {
+    event.preventDefault();
+    setError("");
+    try {
+      await api("/api/admin/users", {
+        method: "POST",
+        body: JSON.stringify({ email, name, password, role })
+      });
+      setEmail("");
+      setName("");
+      setPassword("");
+      setRole("user");
+      await loadUsers();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create user.");
+    }
+  }
+
+  async function updateUser(user: User, patch: Partial<User> & { password?: string }) {
+    await api(`/api/admin/users/${user.id}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch)
+    });
+    await loadUsers();
+  }
+
+  async function deleteUser(user: User) {
+    await api(`/api/admin/users/${user.id}`, { method: "DELETE" });
+    await loadUsers();
+  }
+
+  return (
+    <section className="admin-layout">
+      <form className="admin-create" onSubmit={createUser}>
+        <div className="section-title">
+          <UserPlus size={20} />
+          <h2>Add user</h2>
+        </div>
+        <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Name" />
+        <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email" type="email" />
+        <input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" />
+        <select value={role} onChange={(event) => setRole(event.target.value as Role)}>
+          <option value="user">User</option>
+          <option value="admin">Admin</option>
+        </select>
+        {error && <p className="form-error">{error}</p>}
+        <button className="primary-button" type="submit"><Plus size={18} /><span>Add</span></button>
+      </form>
+
+      <div className="users-panel">
+        <div className="section-title">
+          <Users size={20} />
+          <h2>Users</h2>
+        </div>
+        <div className="user-list">
+          {users.map((user) => (
+            <div className="user-row" key={user.id}>
+              <div>
+                <strong>{user.name}</strong>
+                <span>{user.email}</span>
+              </div>
+              <select
+                value={user.role}
+                disabled={user.id === currentUser.id}
+                onChange={(event) => void updateUser(user, { role: event.target.value as Role })}
+              >
+                <option value="user">User</option>
+                <option value="admin">Admin</option>
+              </select>
+              <label className="switch">
+                <input
+                  checked={!user.disabled}
+                  disabled={user.id === currentUser.id}
+                  onChange={(event) => void updateUser(user, { disabled: !event.target.checked })}
+                  type="checkbox"
+                />
+                <span />
+              </label>
+              <button className="icon-button" disabled={user.id === currentUser.id} onClick={() => void deleteUser(user)} title="Delete" type="button">
+                <Trash2 size={18} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function GridSkeleton() {
+  return (
+    <div className="photo-grid skeleton-grid">
+      {Array.from({ length: 16 }).map((_, index) => <div className="skeleton-tile" key={index} />)}
+    </div>
+  );
+}
+
+function Splash() {
+  return (
+    <div className="splash">
+      <div className="brand-mark"><Camera size={28} /></div>
+    </div>
+  );
+}
+
+async function api<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {})
+    }
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: "Request failed." }));
+    throw new Error(error.error ?? "Request failed.");
+  }
+  return response.json() as Promise<T>;
+}
+
+function groupAssets(assets: Asset[]) {
+  const groups = new Map<string, Asset[]>();
+  for (const asset of assets) {
+    const label = prettyDate(asset.takenAt);
+    groups.set(label, [...(groups.get(label) ?? []), asset]);
+  }
+  return Array.from(groups, ([label, groupAssets]) => ({ label, assets: groupAssets }));
+}
+
+function prettyDate(value: string) {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes / 1024;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[index]}`;
+}
+
+function labelFor(view: View) {
+  return view.charAt(0).toUpperCase() + view.slice(1);
+}
+
+createRoot(document.getElementById("root")!).render(<App />);
