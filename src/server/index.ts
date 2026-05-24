@@ -18,6 +18,8 @@ const tempDir = path.join(dataDir, "tmp");
 const dbPath = path.join(dataDir, "photos.sqlite");
 const sessionCookie = "sjodin_session";
 const sessionTtlMs = 1000 * 60 * 60 * 24 * 30;
+const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES ?? 500);
+const maxUploadFileSizeMb = Number(process.env.MAX_UPLOAD_FILE_SIZE_MB ?? 120);
 
 type Role = "admin" | "user";
 
@@ -75,11 +77,15 @@ const app = express();
 const upload = multer({
   dest: tempDir,
   limits: {
-    fileSize: 1024 * 1024 * 120,
-    files: 50
+    fileSize: 1024 * 1024 * maxUploadFileSizeMb,
+    files: maxUploadFiles
   },
   fileFilter: (_req, file, cb) => {
-    cb(null, file.mimetype.startsWith("image/"));
+    if (file.mimetype.startsWith("image/")) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error("Only image files can be uploaded."));
   }
 });
 
@@ -375,7 +381,7 @@ app.get("/api/assets", (req, res) => {
   res.json({ assets: assets.map((asset) => toPublicAsset(asset)) });
 });
 
-app.post("/api/assets", upload.array("photos", 50), async (req, res, next) => {
+app.post("/api/assets", upload.array("photos", maxUploadFiles), async (req, res, next) => {
   try {
     const user = authUser(req);
     const files = (req.files ?? []) as Express.Multer.File[];
@@ -495,7 +501,7 @@ app.post("/api/albums", (req, res) => {
   res.status(201).json({ album: toPublicAlbum(album) });
 });
 
-app.post("/api/albums/:id/upload", upload.array("photos", 50), async (req, res, next) => {
+app.post("/api/albums/:id/upload", upload.array("photos", maxUploadFiles), async (req, res, next) => {
   try {
     const user = authUser(req);
     const albumId = String(req.params.id);
@@ -631,6 +637,22 @@ app.get(/.*/, async (_req, res) => {
 
 app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(error);
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_COUNT") {
+      res.status(413).json({ error: `Upload up to ${maxUploadFiles} images at a time.` });
+      return;
+    }
+    if (error.code === "LIMIT_FILE_SIZE") {
+      res.status(413).json({ error: `Each image must be ${maxUploadFileSizeMb} MB or smaller.` });
+      return;
+    }
+    res.status(400).json({ error: error.message });
+    return;
+  }
+  if (error instanceof Error && error.message === "Only image files can be uploaded.") {
+    res.status(400).json({ error: error.message });
+    return;
+  }
   res.status(500).json({ error: "Something went wrong." });
 });
 

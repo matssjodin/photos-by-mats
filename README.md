@@ -27,6 +27,8 @@ DATA_DIR=/app/data
 SESSION_SECRET=<long random secret>
 ADMIN_EMAIL=<your admin email>
 ADMIN_PASSWORD=<your first admin password>
+MAX_UPLOAD_FILES=500
+MAX_UPLOAD_FILE_SIZE_MB=120
 ```
 
 Mount persistent storage to `/app/data`. Originals, generated previews, thumbnails, and the SQLite database file all live there:
@@ -58,3 +60,5 @@ There is no public sign-up route. New users are created from the in-app Admin sc
 If you change `ADMIN_EMAIL` or `ADMIN_PASSWORD` after the app has already created its database, redeploy or restart the container. The configured admin account is reconciled during server startup.
 
 Individual photo file routes require authentication. Public sharing is album-only through random `/share/<token>` links; shared viewers can browse album previews without receiving direct original-file URLs.
+
+Uploads accept up to `MAX_UPLOAD_FILES` images per request, defaulting to 500. Very large batches can still take a while because the server generates previews and thumbnails before responding.
