@@ -379,8 +379,8 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
 }
 
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
-  const [email, setEmail] = useState("admin@example.com");
-  const [password, setPassword] = useState("change-me-before-deploy");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
