@@ -1,6 +1,5 @@
 FROM node:24-bookworm-slim AS base
 WORKDIR /app
-ENV NODE_ENV=production
 
 FROM base AS deps
 COPY package*.json ./
@@ -11,6 +10,7 @@ COPY . .
 RUN npm run build
 
 FROM base AS runner
+ENV NODE_ENV=production
 ENV PORT=4000
 ENV DATA_DIR=/app/data
 COPY package*.json ./
