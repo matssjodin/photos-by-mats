@@ -145,7 +145,7 @@ db.exec(`
 
 ensureColumn("albums", "share_token", "TEXT");
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_share_token ON albums(share_token) WHERE share_token IS NOT NULL");
-bootstrapAdmin();
+ensureAdminAccount();
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -638,28 +638,50 @@ app.listen(port, () => {
   console.log(`Sjodin Photos is running on port ${port}`);
 });
 
-function bootstrapAdmin() {
+function ensureAdminAccount() {
   const userCount = db.prepare("SELECT COUNT(*) as count FROM users").get() as { count: number };
-  if (userCount.count > 0) return;
+  const configuredEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+  const configuredPassword = process.env.ADMIN_PASSWORD;
 
-  const adminEmail = process.env.ADMIN_EMAIL ?? "admin@example.com";
-  const adminPassword = process.env.ADMIN_PASSWORD ?? "change-me-before-deploy";
-  const credentials = hashPassword(adminPassword);
+  if (configuredEmail && configuredPassword) {
+    upsertAdmin(configuredEmail, configuredPassword, "Admin");
+    return;
+  }
+
+  if (userCount.count > 0) {
+    if (configuredEmail && !configuredPassword) {
+      console.warn("ADMIN_EMAIL is set but ADMIN_PASSWORD is missing, so the configured admin was not updated.");
+    }
+    return;
+  }
+
+  upsertAdmin("admin@example.com", "change-me-before-deploy", "Admin");
+  console.warn("Created development admin: admin@example.com / change-me-before-deploy");
+}
+
+function upsertAdmin(email: string, password: string, name: string) {
+  const existing = db.prepare("SELECT * FROM users WHERE lower(email) = lower(?)").get(email) as UserRow | undefined;
+  const credentials = hashPassword(password);
+  if (existing) {
+    db.prepare(`
+      UPDATE users
+      SET name = ?, role = 'admin', password_hash = ?, salt = ?, disabled = 0
+      WHERE id = ?
+    `).run(existing.name || name, credentials.hash, credentials.salt, existing.id);
+    return;
+  }
+
   db.prepare(`
     INSERT INTO users (id, email, name, role, password_hash, salt, disabled, created_at)
     VALUES (?, ?, ?, 'admin', ?, ?, 0, ?)
   `).run(
     crypto.randomUUID(),
-    adminEmail.trim().toLowerCase(),
-    "Admin",
+    email,
+    name,
     credentials.hash,
     credentials.salt,
     new Date().toISOString()
   );
-
-  if (!process.env.ADMIN_PASSWORD) {
-    console.warn("Created development admin: admin@example.com / change-me-before-deploy");
-  }
 }
 
 function ensureColumn(table: string, column: string, definition: string) {

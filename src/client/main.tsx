@@ -987,8 +987,14 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
     }
   });
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: "Request failed." }));
-    throw new Error(error.error ?? "Request failed.");
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const error = await response.json().catch(() => ({ error: "" }));
+      throw new Error(error.error || `Request failed with ${response.status}.`);
+    }
+    const text = await response.text().catch(() => "");
+    const shortText = text.replace(/\s+/g, " ").trim().slice(0, 140);
+    throw new Error(shortText || `Request failed with ${response.status}.`);
   }
   return response.json() as Promise<T>;
 }

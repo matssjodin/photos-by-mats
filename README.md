@@ -12,7 +12,7 @@ npm run dev
 Frontend: <http://localhost:5173>  
 API: <http://localhost:4000>
 
-On the first run, the server creates one admin account from `ADMIN_EMAIL` and `ADMIN_PASSWORD`. In development it falls back to:
+On startup, the server ensures the account from `ADMIN_EMAIL` and `ADMIN_PASSWORD` exists, is enabled, has admin access, and has that password. In development, if no users exist and those variables are missing, it falls back to:
 
 - Email: `admin@example.com`
 - Password: `change-me-before-deploy`
@@ -32,5 +32,7 @@ ADMIN_PASSWORD=<your first admin password>
 Mount persistent storage to `/app/data`. Originals, generated previews, thumbnails, and the SQLite database all live there.
 
 There is no public sign-up route. New users are created from the in-app Admin screen.
+
+If you change `ADMIN_EMAIL` or `ADMIN_PASSWORD` after the app has already created its database, redeploy or restart the container. The configured admin account is reconciled during server startup.
 
 Individual photo file routes require authentication. Public sharing is album-only through random `/share/<token>` links; shared viewers can browse album previews without receiving direct original-file URLs.
