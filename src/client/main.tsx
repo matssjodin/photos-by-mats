@@ -275,7 +275,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
             <button
               className={view === item.id ? "nav-item active" : "nav-item"}
               key={item.id}
-              onClick={() => setView(item.id)}
+              onClick={() => { setView(item.id); if (item.id === "albums") setActiveAlbum(null); }}
               type="button"
             >
               <item.icon size={19} />
@@ -357,6 +357,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
               onAddExisting={openAddModal}
               onBack={() => setActiveAlbum(null)}
               onSelect={setSelected}
+              onSetCover={activeAlbum ? setCoverPhoto : undefined}
               onShare={shareAlbum}
               onUpload={() => fileInput.current?.click()}
             />
@@ -549,6 +550,7 @@ function LibraryView({
   onAddExisting,
   onBack,
   onSelect,
+  onSetCover,
   onShare,
   onUpload
 }: {
@@ -558,6 +560,7 @@ function LibraryView({
   onAddExisting: () => void;
   onBack: () => void;
   onSelect: (asset: Asset) => void;
+  onSetCover?: (albumId: string, assetId: string) => Promise<void>;
   onShare: (album: Album) => Promise<void>;
   onUpload: () => void;
 }) {
@@ -592,6 +595,14 @@ function LibraryView({
               <button className="photo-tile" key={asset.id} onClick={() => onSelect(asset)} type="button">
                 <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" />
                 {asset.favorite && <span className="tile-badge"><Heart size={14} fill="currentColor" /></span>}
+                {activeAlbum && onSetCover && (
+                  <span
+                    className="tile-cover-btn"
+                    onClick={(e) => { e.stopPropagation(); void onSetCover(activeAlbum.id, asset.id); }}
+                    role="button"
+                    title="Set as album cover"
+                  ><Star size={12} /></span>
+                )}
               </button>
             ))}
           </div>
@@ -715,8 +726,10 @@ function AlbumsView({
                 ? <img className="album-cover" src={`/api/assets/${album.coverAssetId}/file/thumb`} alt={album.title} />
                 : <div className="album-art"><Images size={32} /></div>
               }
-              <strong>{album.title}</strong>
-              <span>{album.assetCount ?? 0} item{album.assetCount === 1 ? "" : "s"}</span>
+              <div className="album-label">
+                <strong>{album.title}</strong>
+                <span>{album.assetCount ?? 0} item{album.assetCount === 1 ? "" : "s"}</span>
+              </div>
             </button>
             <button className="icon-button" onClick={() => void onShare(album)} title="Share album" type="button">
               <Sparkles size={18} />
