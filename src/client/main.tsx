@@ -193,6 +193,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     setSelected((current) => current?.id === data.asset.id ? data.asset : current);
     setAssets((current) => current.map((item) => item.id === data.asset.id ? data.asset : item));
     if (view !== "photos") await loadAssets(view);
+    if (patch.trashed !== undefined) void loadAlbums();
   }
 
   async function deleteAsset(asset: Asset) {
@@ -274,6 +275,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
       api(`/api/assets/${id}`, { method: "PATCH", body: JSON.stringify({ trashed: true }) })
     ));
     setAssets((current) => current.filter((a) => !ids.includes(a.id)));
+    void loadAlbums();
   }
 
   function handleDrop(event: React.DragEvent<HTMLElement>) {

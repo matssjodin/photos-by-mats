@@ -475,7 +475,11 @@ app.get("/api/albums", (req, res) => {
   const albums = db.prepare(`
     SELECT
       albums.id, albums.user_id, albums.title, albums.share_token, albums.created_at,
-      COUNT(album_assets.asset_id) AS asset_count,
+      (
+        SELECT COUNT(*) FROM album_assets aa
+        JOIN assets ON assets.id = aa.asset_id
+        WHERE aa.album_id = albums.id AND assets.trashed = 0
+      ) AS asset_count,
       COALESCE(
         albums.cover_asset_id,
         (
@@ -486,9 +490,7 @@ app.get("/api/albums", (req, res) => {
         )
       ) AS cover_asset_id
     FROM albums
-    LEFT JOIN album_assets ON album_assets.album_id = albums.id
     WHERE albums.user_id = ?
-    GROUP BY albums.id
     ORDER BY albums.created_at DESC
   `).all(user.id) as AlbumRow[];
   res.json({ albums: albums.map(toPublicAlbum) });
@@ -693,7 +695,7 @@ function getAlbumById(albumId: string): AlbumRow {
   return db.prepare(`
     SELECT
       albums.id, albums.user_id, albums.title, albums.share_token, albums.created_at,
-      (SELECT COUNT(*) FROM album_assets WHERE album_id = albums.id) AS asset_count,
+      (SELECT COUNT(*) FROM album_assets aa JOIN assets ON assets.id = aa.asset_id WHERE aa.album_id = albums.id AND assets.trashed = 0) AS asset_count,
       COALESCE(
         albums.cover_asset_id,
         (
