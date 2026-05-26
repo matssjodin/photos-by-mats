@@ -239,6 +239,16 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     setMessage("Share link copied");
   }
 
+  async function setCoverPhoto(albumId: string, assetId: string) {
+    const data = await api<{ album: Album }>(`/api/albums/${albumId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ coverAssetId: assetId })
+    });
+    setAlbums((current) => current.map((item) => item.id === data.album.id ? data.album : item));
+    setActiveAlbum((current) => current?.id === data.album.id ? data.album : current);
+    setMessage("Cover updated");
+  }
+
   function handleDrop(event: React.DragEvent<HTMLElement>) {
     event.preventDefault();
     setDragging(false);
@@ -366,6 +376,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
 
       {selected && (
         <Viewer
+          activeAlbum={activeAlbum}
           albums={albums}
           asset={selected}
           assets={visibleAssets}
@@ -374,6 +385,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
           onDelete={deleteAsset}
           onMutate={mutateAsset}
           onSelect={setSelected}
+          onSetCover={setCoverPhoto}
         />
       )}
     </div>
@@ -699,7 +711,10 @@ function AlbumsView({
         {albums.map((album) => (
           <div className="album-tile" key={album.id}>
             <button className="album-open" onClick={() => onOpen(album)} type="button">
-              <div className="album-art"><Images size={32} /></div>
+              {album.coverAssetId
+                ? <img className="album-cover" src={`/api/assets/${album.coverAssetId}/file/thumb`} alt={album.title} />
+                : <div className="album-art"><Images size={32} /></div>
+              }
               <strong>{album.title}</strong>
               <span>{album.assetCount ?? 0} item{album.assetCount === 1 ? "" : "s"}</span>
             </button>
@@ -778,6 +793,7 @@ function AddExistingModal({
 }
 
 function Viewer({
+  activeAlbum,
   albums,
   asset,
   assets,
@@ -785,8 +801,10 @@ function Viewer({
   onClose,
   onDelete,
   onMutate,
-  onSelect
+  onSelect,
+  onSetCover
 }: {
+  activeAlbum: Album | null;
   albums: Album[];
   asset: Asset;
   assets: Asset[];
@@ -795,6 +813,7 @@ function Viewer({
   onDelete: (asset: Asset) => Promise<void>;
   onMutate: (asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) => Promise<void>;
   onSelect: (asset: Asset) => void;
+  onSetCover: (albumId: string, assetId: string) => Promise<void>;
 }) {
   const [showInfo, setShowInfo] = useState(() => localStorage.getItem(viewerInfoStorageKey) === "true");
   const index = assets.findIndex((item) => item.id === asset.id);
@@ -845,6 +864,9 @@ function Viewer({
           <div className="info-actions">
             {asset.urls.original && (
               <a className="secondary-button" href={asset.urls.original} target="_blank" rel="noreferrer">Original</a>
+            )}
+            {activeAlbum && (
+              <button className="secondary-button" onClick={() => void onSetCover(activeAlbum.id, asset.id)} type="button">Set as cover</button>
             )}
             {asset.trashed ? (
               <button className="danger-button" onClick={() => void onDelete(asset)} type="button">Delete permanently</button>

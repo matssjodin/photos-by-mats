@@ -541,6 +541,14 @@ button:disabled {
   color: var(--accent-strong);
 }
 
+.album-cover {
+  width: 100%;
+  height: 84px;
+  object-fit: cover;
+  border-radius: 8px;
+  display: block;
+}
+
 .viewer {
   position: fixed;
   inset: 0;

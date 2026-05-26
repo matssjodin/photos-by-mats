@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
+import { parse as parseExif } from "exifr";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -151,6 +152,7 @@ db.exec(`
 
 ensureColumn("albums", "share_token", "TEXT");
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_share_token ON albums(share_token) WHERE share_token IS NOT NULL");
+ensureColumn("albums", "cover_asset_id", "TEXT");
 ensureAdminAccount();
 
 app.use(express.json({ limit: "1mb" }));
@@ -171,7 +173,7 @@ app.get("/api/share/:token", (req, res) => {
     SELECT assets.* FROM album_assets
     JOIN assets ON assets.id = album_assets.asset_id
     WHERE album_assets.album_id = ? AND assets.trashed = 0
-    ORDER BY album_assets.added_at DESC
+    ORDER BY assets.taken_at ASC, assets.original_name ASC
   `).all(album.id) as AssetRow[];
 
   res.json({
@@ -470,13 +472,17 @@ app.delete("/api/assets/:id", async (req, res) => {
 app.get("/api/albums", (req, res) => {
   const user = authUser(req);
   const albums = db.prepare(`
-    SELECT albums.*,
+    SELECT
+      albums.id, albums.user_id, albums.title, albums.share_token, albums.created_at,
       COUNT(album_assets.asset_id) AS asset_count,
-      (
-        SELECT assets.id FROM album_assets aa
-        JOIN assets ON assets.id = aa.asset_id
-        WHERE aa.album_id = albums.id AND assets.trashed = 0
-        ORDER BY aa.added_at DESC LIMIT 1
+      COALESCE(
+        albums.cover_asset_id,
+        (
+          SELECT assets.id FROM album_assets aa
+          JOIN assets ON assets.id = aa.asset_id
+          WHERE aa.album_id = albums.id AND assets.trashed = 0
+          ORDER BY aa.added_at DESC LIMIT 1
+        )
       ) AS cover_asset_id
     FROM albums
     LEFT JOIN album_assets ON album_assets.album_id = albums.id
@@ -497,8 +503,32 @@ app.post("/api/albums", (req, res) => {
   const id = crypto.randomUUID();
   db.prepare("INSERT INTO albums (id, user_id, title, share_token, created_at) VALUES (?, ?, ?, NULL, ?)")
     .run(id, user.id, title, new Date().toISOString());
-  const album = db.prepare("SELECT * FROM albums WHERE id = ?").get(id) as AlbumRow;
-  res.status(201).json({ album: toPublicAlbum(album) });
+  res.status(201).json({ album: toPublicAlbum(getAlbumById(id)) });
+});
+
+app.patch("/api/albums/:id", (req, res) => {
+  const user = authUser(req);
+  const albumId = String(req.params.id);
+  const { coverAssetId } = req.body as { coverAssetId?: string | null };
+
+  const existing = db.prepare("SELECT * FROM albums WHERE id = ? AND user_id = ?").get(albumId, user.id) as AlbumRow | undefined;
+  if (!existing) {
+    res.status(404).json({ error: "Album not found." });
+    return;
+  }
+
+  if (coverAssetId !== undefined) {
+    if (coverAssetId) {
+      const asset = findOwnedAsset(String(coverAssetId), user);
+      if (!asset) {
+        res.status(404).json({ error: "Asset not found." });
+        return;
+      }
+    }
+    db.prepare("UPDATE albums SET cover_asset_id = ? WHERE id = ?").run(coverAssetId || null, albumId);
+  }
+
+  res.json({ album: toPublicAlbum(getAlbumById(albumId)) });
 });
 
 app.post("/api/albums/:id/upload", upload.array("photos", maxUploadFiles), async (req, res, next) => {
@@ -543,7 +573,7 @@ app.get("/api/albums/:id/assets", (req, res) => {
     SELECT assets.* FROM album_assets
     JOIN assets ON assets.id = album_assets.asset_id
     WHERE album_assets.album_id = ? AND assets.trashed = 0
-    ORDER BY album_assets.added_at DESC
+    ORDER BY assets.taken_at ASC, assets.original_name ASC
   `).all(albumId) as AssetRow[];
   res.json({ assets: assets.map((asset) => toPublicAsset(asset)) });
 });
@@ -588,8 +618,7 @@ app.post("/api/albums/:id/share", (req, res) => {
 
   const token = album.share_token ?? crypto.randomBytes(18).toString("base64url");
   db.prepare("UPDATE albums SET share_token = ? WHERE id = ?").run(token, albumId);
-  const updated = db.prepare("SELECT * FROM albums WHERE id = ?").get(albumId) as AlbumRow;
-  res.json({ album: toPublicAlbum(updated) });
+  res.json({ album: toPublicAlbum(getAlbumById(albumId)) });
 });
 
 app.delete("/api/albums/:id/share", (req, res) => {
@@ -601,8 +630,7 @@ app.delete("/api/albums/:id/share", (req, res) => {
     return;
   }
   db.prepare("UPDATE albums SET share_token = NULL WHERE id = ?").run(albumId);
-  const updated = db.prepare("SELECT * FROM albums WHERE id = ?").get(albumId) as AlbumRow;
-  res.json({ album: toPublicAlbum(updated) });
+  res.json({ album: toPublicAlbum(getAlbumById(albumId)) });
 });
 
 app.delete("/api/albums/:id/assets/:assetId", (req, res) => {
@@ -659,6 +687,24 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
 app.listen(port, () => {
   console.log(`Sjodin Photos is running on port ${port}`);
 });
+
+function getAlbumById(albumId: string): AlbumRow {
+  return db.prepare(`
+    SELECT
+      albums.id, albums.user_id, albums.title, albums.share_token, albums.created_at,
+      (SELECT COUNT(*) FROM album_assets WHERE album_id = albums.id) AS asset_count,
+      COALESCE(
+        albums.cover_asset_id,
+        (
+          SELECT assets.id FROM album_assets aa
+          JOIN assets ON assets.id = aa.asset_id
+          WHERE aa.album_id = albums.id AND assets.trashed = 0
+          ORDER BY aa.added_at DESC LIMIT 1
+        )
+      ) AS cover_asset_id
+    FROM albums WHERE id = ?
+  `).get(albumId) as AlbumRow;
+}
 
 function ensureAdminAccount() {
   const userCount = db.prepare("SELECT COUNT(*) as count FROM users").get() as { count: number };
@@ -797,6 +843,17 @@ async function ingestAsset(userId: string, file: Express.Multer.File) {
     .toFile(path.join(dataDir, thumbPath));
 
   const now = new Date().toISOString();
+  let takenAt = now;
+  try {
+    const tags = await parseExif(absoluteOriginal, ["DateTimeOriginal", "CreateDate"]);
+    const exifDate = tags?.DateTimeOriginal ?? tags?.CreateDate;
+    if (exifDate instanceof Date && !isNaN(exifDate.getTime())) {
+      takenAt = exifDate.toISOString();
+    }
+  } catch {
+    // no EXIF date available
+  }
+
   db.prepare(`
     INSERT INTO assets (
       id, user_id, original_name, mime_type, size_bytes, width, height,
@@ -810,7 +867,7 @@ async function ingestAsset(userId: string, file: Express.Multer.File) {
     file.size,
     metadata.width ?? null,
     metadata.height ?? null,
-    now,
+    takenAt,
     now,
     originalPath,
     previewPath,
