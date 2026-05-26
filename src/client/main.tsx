@@ -103,6 +103,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [activeAlbum, setActiveAlbum] = useState<Album | null>(null);
   const [selected, setSelected] = useState<Asset | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -121,6 +122,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   }, [assets, search, activeAlbum]);
 
   useEffect(() => {
+    setSelectedIds(new Set());
     if (view === "admin") return;
     if (view === "albums") {
       loadAlbums();
@@ -249,6 +251,31 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     setMessage("Cover updated");
   }
 
+  function startSelect(id: string) {
+    setSelectedIds(new Set([id]));
+  }
+
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function clearSelect() {
+    setSelectedIds(new Set());
+  }
+
+  async function trashSelected() {
+    const ids = [...selectedIds];
+    clearSelect();
+    await Promise.all(ids.map((id) =>
+      api(`/api/assets/${id}`, { method: "PATCH", body: JSON.stringify({ trashed: true }) })
+    ));
+    setAssets((current) => current.filter((a) => !ids.includes(a.id)));
+  }
+
   function handleDrop(event: React.DragEvent<HTMLElement>) {
     event.preventDefault();
     setDragging(false);
@@ -356,10 +383,15 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
               busy={busy}
               onAddExisting={openAddModal}
               onBack={() => setActiveAlbum(null)}
+              onClearSelect={clearSelect}
               onSelect={setSelected}
               onSetCover={activeAlbum ? setCoverPhoto : undefined}
               onShare={shareAlbum}
+              onStartSelect={startSelect}
+              onToggleSelect={toggleSelect}
+              onTrashSelected={trashSelected}
               onUpload={() => fileInput.current?.click()}
+              selectedIds={selectedIds}
             />
           </DropArea>
         )}
@@ -549,21 +581,74 @@ function LibraryView({
   busy,
   onAddExisting,
   onBack,
+  onClearSelect = () => {},
   onSelect,
   onSetCover,
   onShare,
-  onUpload
+  onStartSelect = () => {},
+  onToggleSelect = () => {},
+  onTrashSelected = async () => {},
+  onUpload,
+  selectedIds = new Set<string>(),
 }: {
   activeAlbum: Album | null;
   assets: Asset[];
   busy: boolean;
   onAddExisting: () => void;
   onBack: () => void;
+  onClearSelect?: () => void;
   onSelect: (asset: Asset) => void;
   onSetCover?: (albumId: string, assetId: string) => Promise<void>;
   onShare: (album: Album) => Promise<void>;
+  onStartSelect?: (id: string) => void;
+  onToggleSelect?: (id: string) => void;
+  onTrashSelected?: () => Promise<void>;
   onUpload: () => void;
+  selectedIds?: Set<string>;
 }) {
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressFired = useRef(false);
+  const isPressing = useRef(false);
+
+  function handlePointerDown(assetId: string) {
+    if (selectedIds.size > 0) return;
+    isPressing.current = true;
+    longPressFired.current = false;
+    longPressTimer.current = setTimeout(() => {
+      longPressFired.current = true;
+      isPressing.current = false;
+      onStartSelect(assetId);
+    }, 3000);
+  }
+
+  function handlePointerUp() {
+    isPressing.current = false;
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  }
+
+  function handlePointerMove() {
+    if (isPressing.current) {
+      isPressing.current = false;
+      clearTimeout(longPressTimer.current!);
+      longPressTimer.current = null;
+    }
+  }
+
+  function handleTileClick(asset: Asset) {
+    if (longPressFired.current) {
+      longPressFired.current = false;
+      return;
+    }
+    if (selectedIds.size > 0) {
+      onToggleSelect(asset.id);
+    } else {
+      onSelect(asset);
+    }
+  }
+
   if (busy && assets.length === 0) return <GridSkeleton />;
 
   if (!assets.length) {
@@ -583,32 +668,64 @@ function LibraryView({
   }
 
   return (
-    <section className="library">
-      {activeAlbum && (
-        <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onShare={onShare} onUpload={onUpload} />
-      )}
-      {groupAssets(assets).map((group) => (
-        <div className="date-group" key={group.label}>
-          <h2>{group.label}</h2>
-          <div className="photo-grid">
-            {group.assets.map((asset) => (
-              <button className="photo-tile" key={asset.id} onClick={() => onSelect(asset)} type="button">
-                <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" />
-                {asset.favorite && <span className="tile-badge"><Heart size={14} fill="currentColor" /></span>}
-                {activeAlbum && onSetCover && (
-                  <span
-                    className="tile-cover-btn"
-                    onClick={(e) => { e.stopPropagation(); void onSetCover(activeAlbum.id, asset.id); }}
-                    role="button"
-                    title="Set as album cover"
-                  ><Star size={12} /></span>
-                )}
-              </button>
-            ))}
+    <>
+      <section className="library">
+        {activeAlbum && (
+          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onShare={onShare} onUpload={onUpload} />
+        )}
+        {groupAssets(assets).map((group) => (
+          <div className="date-group" key={group.label}>
+            <h2>{group.label}</h2>
+            <div className="photo-grid">
+              {group.assets.map((asset) => {
+                const isSelected = selectedIds.has(asset.id);
+                const inSelectMode = selectedIds.size > 0;
+                return (
+                  <button
+                    className={`photo-tile${inSelectMode ? " selectable" : ""}${isSelected ? " is-selected" : ""}`}
+                    key={asset.id}
+                    onClick={() => handleTileClick(asset)}
+                    onPointerDown={() => handlePointerDown(asset.id)}
+                    onPointerUp={handlePointerUp}
+                    onPointerMove={handlePointerMove}
+                    onPointerCancel={handlePointerUp}
+                    onContextMenu={(e) => e.preventDefault()}
+                    type="button"
+                  >
+                    <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" draggable={false} />
+                    {inSelectMode
+                      ? <span className={`tile-checkbox${isSelected ? " checked" : ""}`} />
+                      : <>
+                          {asset.favorite && <span className="tile-badge"><Heart size={14} fill="currentColor" /></span>}
+                          {activeAlbum && onSetCover && (
+                            <span
+                              className="tile-cover-btn"
+                              onClick={(e) => { e.stopPropagation(); void onSetCover(activeAlbum.id, asset.id); }}
+                              role="button"
+                              title="Set as album cover"
+                            ><Star size={12} /></span>
+                          )}
+                        </>
+                    }
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </section>
+      {selectedIds.size > 0 && (
+        <div className="select-bar">
+          <span>{selectedIds.size} photo{selectedIds.size === 1 ? "" : "s"} selected</span>
+          <div className="select-bar-actions">
+            <button className="secondary-button" onClick={onClearSelect} type="button">Cancel</button>
+            <button className="danger-button" onClick={() => void onTrashSelected()} type="button">
+              <Trash2 size={18} /><span>Trash</span>
+            </button>
           </div>
         </div>
-      ))}
-    </section>
+      )}
+    </>
   );
 }
 

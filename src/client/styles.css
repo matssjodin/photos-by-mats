@@ -373,6 +373,71 @@ button:disabled {
   transform: scale(1.035);
 }
 
+.photo-tile {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.photo-tile.selectable:not(.is-selected) img {
+  opacity: 0.5;
+}
+
+.tile-checkbox {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.9);
+  background: rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
+
+.tile-checkbox.checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.tile-checkbox.checked::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 1px;
+  width: 7px;
+  height: 11px;
+  border: 2px solid white;
+  border-top: 0;
+  border-left: 0;
+  transform: rotate(45deg);
+}
+
+.select-bar {
+  position: fixed;
+  bottom: 0;
+  left: 280px;
+  right: 0;
+  z-index: 30;
+  padding: 14px clamp(18px, 4vw, 44px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  background: #102a2a;
+  color: white;
+  animation: slideUp 180ms ease;
+}
+
+@keyframes slideUp {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+.select-bar-actions {
+  display: flex;
+  gap: 10px;
+}
+
 .tile-cover-btn {
   position: absolute;
   bottom: 8px;
@@ -1002,5 +1067,9 @@ button:disabled {
 
   .user-row {
     grid-template-columns: 1fr;
+  }
+
+  .select-bar {
+    left: 0;
   }
 }
