@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git Workflow
+
+After every change, commit and push to `origin main`:
+
+```bash
+git add <changed files>
+git commit -m "Description of change"
+git push origin main
+```
+
 ## Commands
 
 ```bash

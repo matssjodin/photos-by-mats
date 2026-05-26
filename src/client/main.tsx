@@ -796,7 +796,7 @@ function Viewer({
   onMutate: (asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) => Promise<void>;
   onSelect: (asset: Asset) => void;
 }) {
-  const [showInfo, setShowInfo] = useState(() => localStorage.getItem(viewerInfoStorageKey) !== "false");
+  const [showInfo, setShowInfo] = useState(() => localStorage.getItem(viewerInfoStorageKey) === "true");
   const index = assets.findIndex((item) => item.id === asset.id);
   const previous = index > 0 ? assets[index - 1] : null;
   const next = index >= 0 && index < assets.length - 1 ? assets[index + 1] : null;
