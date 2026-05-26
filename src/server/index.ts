@@ -6,7 +6,8 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
-import { parse as parseExif } from "exifr";
+import exifrPkg from "exifr";
+const parseExif = exifrPkg.parse.bind(exifrPkg);
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
