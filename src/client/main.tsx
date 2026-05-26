@@ -71,6 +71,8 @@ const navItems = [
   { id: "trash", label: "Trash", icon: Trash2 }
 ] as const;
 
+const viewerInfoStorageKey = "sjodinPhotos.viewer.showInfo";
+
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [booting, setBooting] = useState(true);
@@ -794,7 +796,7 @@ function Viewer({
   onMutate: (asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) => Promise<void>;
   onSelect: (asset: Asset) => void;
 }) {
-  const [showInfo, setShowInfo] = useState(true);
+  const [showInfo, setShowInfo] = useState(() => localStorage.getItem(viewerInfoStorageKey) !== "false");
   const index = assets.findIndex((item) => item.id === asset.id);
   const previous = index > 0 ? assets[index - 1] : null;
   const next = index >= 0 && index < assets.length - 1 ? assets[index + 1] : null;
@@ -809,15 +811,23 @@ function Viewer({
     return () => window.removeEventListener("keydown", onKey);
   }, [next, previous, onClose, onSelect]);
 
+  function toggleInfo() {
+    setShowInfo((current) => {
+      const nextValue = !current;
+      localStorage.setItem(viewerInfoStorageKey, String(nextValue));
+      return nextValue;
+    });
+  }
+
   return (
-    <div className="viewer">
+    <div className={showInfo ? "viewer info-open" : "viewer info-closed"}>
       <div className="viewer-toolbar">
         <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
         <div className="viewer-actions">
           <button className={asset.favorite ? "icon-button light active" : "icon-button light"} onClick={() => void onMutate(asset, { favorite: !asset.favorite })} title="Favorite" type="button"><Heart size={20} /></button>
           <button className="icon-button light" onClick={() => void onMutate(asset, { archived: !asset.archived })} title="Archive" type="button"><Archive size={20} /></button>
           <button className="icon-button light" onClick={() => void onMutate(asset, { trashed: !asset.trashed })} title="Trash" type="button"><Trash2 size={20} /></button>
-          <button className={showInfo ? "icon-button light active" : "icon-button light"} onClick={() => setShowInfo(!showInfo)} title="Info" type="button"><Info size={20} /></button>
+          <button className={showInfo ? "icon-button light active" : "icon-button light"} onClick={toggleInfo} title={showInfo ? "Hide info" : "Show info"} type="button"><Info size={20} /></button>
         </div>
       </div>
       {previous && <button className="viewer-nav previous" onClick={() => onSelect(previous)} type="button"><ChevronLeft size={28} /></button>}

@@ -572,6 +572,10 @@ button:disabled {
   object-fit: contain;
 }
 
+.viewer.info-closed .viewer-image {
+  max-width: 96vw;
+}
+
 .viewer-nav {
   position: fixed;
   top: 50%;
@@ -591,6 +595,10 @@ button:disabled {
 
 .viewer-nav.next {
   right: 378px;
+}
+
+.viewer.info-closed .viewer-nav.next {
+  right: 18px;
 }
 
 .viewer-nav.next.public {
