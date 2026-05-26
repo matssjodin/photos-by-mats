@@ -1050,28 +1050,20 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
-  .viewer {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
   .viewer-image {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
     max-width: 96vw;
     max-height: 88vh;
+    width: auto;
+    height: auto;
   }
 
   .viewer.info-open .viewer-image {
-    position: absolute;
-    top: 72px;
-    left: 0;
-    right: 0;
-    bottom: 32vh;
-    margin: auto;
-    max-width: 96vw;
+    top: calc(34vh + 36px);
     max-height: calc(68vh - 72px);
-    width: auto;
-    height: auto;
   }
 
   .info-panel {
