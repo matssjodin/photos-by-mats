@@ -609,6 +609,16 @@ button:disabled {
   max-width: 96vw;
 }
 
+.viewer.info-open .viewer-actions .icon-button.light {
+  background: rgba(0, 0, 0, 0.07);
+  color: var(--ink);
+}
+
+.viewer.info-open .viewer-actions .icon-button.light:hover,
+.viewer.info-open .viewer-actions .icon-button.light.active {
+  background: rgba(0, 0, 0, 0.14);
+}
+
 .info-panel {
   position: fixed;
   top: 0;
