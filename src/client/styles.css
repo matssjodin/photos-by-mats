@@ -1052,9 +1052,11 @@ button:disabled {
 
   .viewer-image {
     position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    margin: auto;
     max-width: 96vw;
     max-height: 88vh;
     width: auto;
@@ -1062,7 +1064,8 @@ button:disabled {
   }
 
   .viewer.info-open .viewer-image {
-    top: calc(34vh + 36px);
+    top: 72px;
+    bottom: 32vh;
     max-height: calc(68vh - 72px);
   }
 
