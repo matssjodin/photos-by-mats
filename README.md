@@ -12,10 +12,12 @@ npm run dev
 Frontend: <http://localhost:5173>  
 API: <http://localhost:4000>
 
-On startup, the server ensures the account from `ADMIN_EMAIL` and `ADMIN_PASSWORD` exists, is enabled, has admin access, and has that password. In development, if no users exist and those variables are missing, it falls back to:
+On startup, the server ensures the account from `ADMIN_EMAIL` and `ADMIN_PASSWORD` exists, is enabled, has admin access, and has that password. In development (NODE_ENV != production), if no users exist and those variables are missing, it falls back to:
 
 - Email: `admin@example.com`
 - Password: `change-me-before-deploy`
+
+In production the server **refuses to start** without `ADMIN_EMAIL`/`ADMIN_PASSWORD` and no existing users — it will not create a default account.
 
 ## Coolify Deployment
 
@@ -24,12 +26,14 @@ Deploy this repository as a Docker app. The database is embedded in the containe
 ```bash
 PORT=4000
 DATA_DIR=/app/data
-SESSION_SECRET=<long random secret>
 ADMIN_EMAIL=<your admin email>
 ADMIN_PASSWORD=<your first admin password>
+APP_ORIGIN=https://photos.example.com
 MAX_UPLOAD_FILES=500
 MAX_UPLOAD_FILE_SIZE_MB=120
 ```
+
+Set `APP_ORIGIN` to the public URL your browser hits — the cross-origin (CSRF) guard uses it to accept your own requests.
 
 Mount persistent storage to `/app/data`. Originals, generated previews, thumbnails, and the SQLite database file all live there:
 

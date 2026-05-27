@@ -110,7 +110,19 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [dragging, setDragging] = useState(false);
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>([]);
+  const [confirmState, setConfirmState] = useState<ConfirmRequest | null>(null);
+  const [linkPrompt, setLinkPrompt] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!message) return;
+    const id = setTimeout(() => setMessage(""), 3500);
+    return () => clearTimeout(id);
+  }, [message]);
+
+  function confirmAction(request: ConfirmRequest) {
+    setConfirmState(request);
+  }
 
   const visibleAssets = useMemo(() => {
     if (!search.trim() || activeAlbum) return assets;
@@ -190,16 +202,38 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
       method: "PATCH",
       body: JSON.stringify(patch)
     });
-    setSelected((current) => current?.id === data.asset.id ? data.asset : current);
-    setAssets((current) => current.map((item) => item.id === data.asset.id ? data.asset : item));
-    if (view !== "photos") await loadAssets(view);
+    const trashedAway = patch.trashed === true && view !== "trash";
+    const archivedAway = patch.archived === true && view !== "archive";
+    const untrashed = patch.trashed === false && view === "trash";
+    const removesFromView = trashedAway || archivedAway || untrashed;
+    if (removesFromView && selected?.id === data.asset.id) {
+      setSelected(null);
+    } else {
+      setSelected((current) => current?.id === data.asset.id ? data.asset : current);
+    }
+    setAssets((current) => removesFromView
+      ? current.filter((item) => item.id !== data.asset.id)
+      : current.map((item) => item.id === data.asset.id ? data.asset : item));
     if (patch.trashed !== undefined) void loadAlbums();
   }
 
   async function deleteAsset(asset: Asset) {
-    await api(`/api/assets/${asset.id}`, { method: "DELETE" });
-    setSelected(null);
-    setAssets((current) => current.filter((item) => item.id !== asset.id));
+    return new Promise<void>((resolve) => {
+      confirmAction({
+        title: "Delete photo permanently?",
+        body: "This removes the original, preview, and thumbnail from disk. It cannot be undone.",
+        confirmLabel: "Delete permanently",
+        danger: true,
+        onConfirm: async () => {
+          await api(`/api/assets/${asset.id}`, { method: "DELETE" });
+          setSelected(null);
+          setAssets((current) => current.filter((item) => item.id !== asset.id));
+          void loadAlbums();
+          resolve();
+        },
+        onCancel: () => resolve()
+      });
+    });
   }
 
   async function createAlbum(title: string, files?: FileList | File[] | null) {
@@ -238,8 +272,12 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     setAlbums((current) => current.map((item) => item.id === data.album.id ? data.album : item));
     setActiveAlbum((current) => current?.id === data.album.id ? data.album : current);
     const absoluteUrl = `${window.location.origin}${data.album.shareUrl}`;
-    await navigator.clipboard?.writeText(absoluteUrl).catch(() => undefined);
-    setMessage("Share link copied");
+    const copied = await navigator.clipboard?.writeText(absoluteUrl).then(() => true).catch(() => false);
+    if (copied) {
+      setMessage("Share link copied");
+    } else {
+      setLinkPrompt(absoluteUrl);
+    }
   }
 
   async function setCoverPhoto(albumId: string, assetId: string) {
@@ -321,6 +359,10 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
               <span>Admin</span>
             </button>
           )}
+          <button className="nav-item mobile-only-nav" onClick={logout} type="button">
+            <LogOut size={19} />
+            <span>Log out</span>
+          </button>
         </nav>
         <div className="account-strip">
           <div>
@@ -423,6 +465,80 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
           onSetCover={setCoverPhoto}
         />
       )}
+
+      {confirmState && (
+        <ConfirmDialog request={confirmState} onClose={() => setConfirmState(null)} />
+      )}
+      {linkPrompt && (
+        <LinkPrompt url={linkPrompt} onClose={() => setLinkPrompt(null)} />
+      )}
+    </div>
+  );
+}
+
+type ConfirmRequest = {
+  title: string;
+  body?: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  danger?: boolean;
+  onConfirm: () => void | Promise<void>;
+  onCancel?: () => void;
+};
+
+function ConfirmDialog({ request, onClose }: { request: ConfirmRequest; onClose: () => void }) {
+  const [busy, setBusy] = useState(false);
+  async function handleConfirm() {
+    setBusy(true);
+    try {
+      await request.onConfirm();
+    } finally {
+      setBusy(false);
+      onClose();
+    }
+  }
+  function handleCancel() {
+    request.onCancel?.();
+    onClose();
+  }
+  return (
+    <div className="modal-backdrop" onClick={handleCancel}>
+      <section className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <h2>{request.title}</h2>
+        </div>
+        {request.body && <p>{request.body}</p>}
+        <div className="modal-actions">
+          <button className="secondary-button" onClick={handleCancel} type="button">{request.cancelLabel ?? "Cancel"}</button>
+          <button
+            className={request.danger ? "danger-button" : "primary-button"}
+            disabled={busy}
+            onClick={() => void handleConfirm()}
+            type="button"
+          >
+            {busy ? "Working" : (request.confirmLabel ?? "Confirm")}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function LinkPrompt({ url, onClose }: { url: string; onClose: () => void }) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => { inputRef.current?.select(); }, []);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <section className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <h2>Share link</h2>
+        </div>
+        <p>Couldn't copy automatically. Select and copy the link below.</p>
+        <input ref={inputRef} readOnly value={url} onFocus={(event) => event.target.select()} />
+        <div className="modal-actions">
+          <button className="primary-button" onClick={onClose} type="button">Done</button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -1064,6 +1180,8 @@ function AdminPanel({ currentUser }: { currentUser: User }) {
   }
 
   async function deleteUser(user: User) {
+    const confirmed = window.confirm(`Delete ${user.email}? This permanently removes the account and all photos.`);
+    if (!confirmed) return;
     await api(`/api/admin/users/${user.id}`, { method: "DELETE" });
     await loadUsers();
   }

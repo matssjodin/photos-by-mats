@@ -259,13 +259,39 @@ button:disabled {
 }
 
 .icon-button.light {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.42);
   color: #fff;
+  backdrop-filter: blur(4px);
 }
 
 .icon-button.light:hover,
 .icon-button.light.active {
-  background: rgba(255, 255, 255, 0.26);
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.mobile-only-nav {
+  display: none;
+}
+
+.confirm-modal {
+  max-width: 460px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 22px;
+}
+
+.confirm-modal p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.confirm-modal input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
 }
 
 .hidden-input {
@@ -1022,6 +1048,10 @@ button:disabled {
     display: none;
   }
 
+  .mobile-only-nav {
+    display: inline-flex;
+  }
+
   .topbar {
     align-items: stretch;
     flex-direction: column;
@@ -1050,7 +1080,12 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
-  .viewer-image {
+  .viewer {
+    display: block;
+  }
+
+  .viewer-image,
+  .viewer-image.public {
     position: fixed;
     top: 0;
     bottom: 0;
@@ -1061,6 +1096,7 @@ button:disabled {
     max-height: 88vh;
     width: auto;
     height: auto;
+    object-fit: contain;
   }
 
   .viewer.info-open .viewer-image {

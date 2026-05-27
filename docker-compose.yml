@@ -8,9 +8,10 @@ services:
     environment:
       PORT: "4000"
       DATA_DIR: /app/data
-      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
       ADMIN_EMAIL: ${ADMIN_EMAIL:?set ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
+      APP_ORIGIN: ${APP_ORIGIN:-}
+      NODE_ENV: production
     volumes:
       - sjodinphotos-data:/app/data
 

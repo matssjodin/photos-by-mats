@@ -22,6 +22,16 @@ const sessionCookie = "sjodin_session";
 const sessionTtlMs = 1000 * 60 * 60 * 24 * 30;
 const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES ?? 500);
 const maxUploadFileSizeMb = Number(process.env.MAX_UPLOAD_FILE_SIZE_MB ?? 120);
+const isProduction = process.env.NODE_ENV === "production";
+const appOrigin = process.env.APP_ORIGIN?.replace(/\/$/, "");
+const ingestConcurrency = Math.max(1, Number(process.env.INGEST_CONCURRENCY ?? 3));
+
+const loginAttempts = new Map<string, { count: number; firstAttempt: number; lockedUntil: number }>();
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 10;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+const DUMMY_HASH = crypto.pbkdf2Sync("dummy", "dummy", 310000, 32, "sha256").toString("hex");
+const DUMMY_SALT = "dummy";
 
 type Role = "admin" | "user";
 
@@ -76,6 +86,7 @@ type PublicUser = {
 };
 
 const app = express();
+app.set("trust proxy", 1);
 const upload = multer({
   dest: tempDir,
   limits: {
@@ -157,6 +168,7 @@ ensureColumn("albums", "cover_asset_id", "TEXT");
 ensureAdminAccount();
 
 app.use(express.json({ limit: "1mb" }));
+app.use(csrfGuard);
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
@@ -207,6 +219,12 @@ app.get("/api/share/:token/file/:assetId/:variant", (req, res) => {
 });
 
 app.post("/api/auth/login", (req, res) => {
+  const ip = clientIp(req);
+  if (isLoginLocked(ip)) {
+    res.status(429).json({ error: "Too many login attempts. Please try again in a few minutes." });
+    return;
+  }
+
   const { email, password } = req.body as { email?: string; password?: string };
   if (!email || !password) {
     res.status(400).json({ error: "Email and password are required." });
@@ -217,11 +235,15 @@ app.post("/api/auth/login", (req, res) => {
     .prepare("SELECT * FROM users WHERE lower(email) = lower(?)")
     .get(email.trim()) as UserRow | undefined;
 
-  if (!user || user.disabled || !verifyPassword(password, user.salt, user.password_hash)) {
+  const valid = user && !user.disabled && verifyPassword(password, user.salt, user.password_hash);
+  if (!valid) {
+    if (!user) verifyPassword(password, DUMMY_SALT, DUMMY_HASH);
+    recordFailedLogin(ip);
     res.status(401).json({ error: "Invalid email or password." });
     return;
   }
 
+  recordSuccessfulLogin(ip);
   const token = crypto.randomBytes(32).toString("base64url");
   const expiresAt = Date.now() + sessionTtlMs;
   db.prepare("INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
@@ -230,7 +252,7 @@ app.post("/api/auth/login", (req, res) => {
   res.setHeader("Set-Cookie", cookie.serialize(sessionCookie, token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: isProduction,
     path: "/",
     maxAge: Math.floor(sessionTtlMs / 1000)
   }));
@@ -251,7 +273,7 @@ app.post("/api/auth/logout", (req, res) => {
   res.setHeader("Set-Cookie", cookie.serialize(sessionCookie, "", {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: isProduction,
     path: "/",
     maxAge: 0
   }));
@@ -332,6 +354,9 @@ app.patch("/api/admin/users/:id", requireAdmin, (req, res) => {
   } else {
     db.prepare("UPDATE users SET name = ?, role = ?, disabled = ? WHERE id = ?")
       .run(nextName, nextRole, nextDisabled, existing.id);
+    if (nextDisabled && !existing.disabled) {
+      db.prepare("DELETE FROM sessions WHERE user_id = ?").run(existing.id);
+    }
   }
 
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(existing.id) as UserRow;
@@ -353,8 +378,14 @@ app.delete("/api/admin/users/:id", requireAdmin, async (req, res) => {
   }
 
   const userAssetDir = path.join(uploadsDir, existing.id);
+  try {
+    await fs.rm(userAssetDir, { recursive: true, force: true });
+  } catch (error) {
+    console.error("Failed to remove user asset directory:", error);
+    res.status(500).json({ error: "Could not delete user files. Aborted." });
+    return;
+  }
   db.prepare("DELETE FROM users WHERE id = ?").run(existing.id);
-  await fs.rm(userAssetDir, { recursive: true, force: true });
   res.json({ ok: true });
 });
 
@@ -393,12 +424,19 @@ app.post("/api/assets", upload.array("photos", maxUploadFiles), async (req, res,
       return;
     }
 
+    const outcomes = await processConcurrent(files, ingestConcurrency, (file) => ingestAsset(user.id, file));
     const created: ReturnType<typeof toPublicAsset>[] = [];
-    for (const file of files) {
-      created.push(await ingestAsset(user.id, file));
-    }
+    const errors: Array<{ name: string; error: string }> = [];
+    outcomes.forEach((outcome, index) => {
+      if (outcome.ok) created.push(outcome.value);
+      else errors.push({ name: files[index].originalname, error: outcome.error.message });
+    });
 
-    res.status(201).json({ assets: created });
+    if (!created.length) {
+      res.status(500).json({ error: "Upload failed.", errors });
+      return;
+    }
+    res.status(201).json({ assets: created, errors });
   } catch (error) {
     next(error);
   }
@@ -424,6 +462,9 @@ app.get("/api/assets/:id/file/:variant", (req, res) => {
   if (!relPath) {
     res.status(404).json({ error: "Variant not found." });
     return;
+  }
+  if (variant === "original") {
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(asset.original_name)}"`);
   }
   res.sendFile(path.join(dataDir, relPath));
 });
@@ -465,6 +506,7 @@ app.delete("/api/assets/:id", async (req, res) => {
     return;
   }
 
+  db.prepare("UPDATE albums SET cover_asset_id = NULL WHERE cover_asset_id = ?").run(asset.id);
   db.prepare("DELETE FROM assets WHERE id = ?").run(asset.id);
   await fs.rm(path.dirname(path.join(dataDir, asset.original_path)), { recursive: true, force: true });
   res.json({ ok: true });
@@ -550,15 +592,29 @@ app.post("/api/albums/:id/upload", upload.array("photos", maxUploadFiles), async
       return;
     }
 
+    const outcomes = await processConcurrent(files, ingestConcurrency, (file) => ingestAsset(user.id, file));
     const created: ReturnType<typeof toPublicAsset>[] = [];
-    for (const file of files) {
-      const asset = await ingestAsset(user.id, file);
-      db.prepare("INSERT OR IGNORE INTO album_assets (album_id, asset_id, added_at) VALUES (?, ?, ?)")
-        .run(albumId, asset.id, new Date().toISOString());
-      created.push(asset);
-    }
+    const errors: Array<{ name: string; error: string }> = [];
+    const insertAlbumAsset = db.prepare("INSERT OR IGNORE INTO album_assets (album_id, asset_id, added_at) VALUES (?, ?, ?)");
+    outcomes.forEach((outcome, index) => {
+      if (!outcome.ok) {
+        errors.push({ name: files[index].originalname, error: outcome.error.message });
+        return;
+      }
+      try {
+        insertAlbumAsset.run(albumId, outcome.value.id, new Date().toISOString());
+        created.push(outcome.value);
+      } catch (error) {
+        db.prepare("DELETE FROM assets WHERE id = ?").run(outcome.value.id);
+        errors.push({ name: files[index].originalname, error: (error as Error).message });
+      }
+    });
 
-    res.status(201).json({ assets: created });
+    if (!created.length) {
+      res.status(500).json({ error: "Upload failed.", errors });
+      return;
+    }
+    res.status(201).json({ assets: created, errors });
   } catch (error) {
     next(error);
   }
@@ -661,6 +717,10 @@ app.delete("/api/albums/:id", (req, res) => {
   res.json({ ok: true });
 });
 
+app.use("/api", (_req, res) => {
+  res.status(404).json({ error: "Endpoint not found." });
+});
+
 app.use(express.static(clientDir));
 app.get(/.*/, async (_req, res) => {
   res.sendFile(path.join(clientDir, "index.html"));
@@ -726,6 +786,11 @@ function ensureAdminAccount() {
     return;
   }
 
+  if (isProduction) {
+    console.error("No users exist and ADMIN_EMAIL/ADMIN_PASSWORD are not set. Refusing to create a default admin in production.");
+    process.exit(1);
+  }
+
   upsertAdmin("admin@example.com", "change-me-before-deploy", "Admin");
   console.warn("Created development admin: admin@example.com / change-me-before-deploy");
 }
@@ -780,6 +845,97 @@ function readSessionToken(req: express.Request) {
   return cookie.parse(header)[sessionCookie];
 }
 
+function clientIp(req: express.Request) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.length) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket.remoteAddress ?? "unknown";
+}
+
+function isLoginLocked(ip: string) {
+  const entry = loginAttempts.get(ip);
+  if (!entry) return false;
+  const now = Date.now();
+  if (entry.lockedUntil > now) return true;
+  if (now - entry.firstAttempt > LOGIN_WINDOW_MS) {
+    loginAttempts.delete(ip);
+    return false;
+  }
+  return false;
+}
+
+function recordFailedLogin(ip: string) {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now - entry.firstAttempt > LOGIN_WINDOW_MS) {
+    loginAttempts.set(ip, { count: 1, firstAttempt: now, lockedUntil: 0 });
+    return;
+  }
+  entry.count += 1;
+  if (entry.count >= LOGIN_MAX_ATTEMPTS) {
+    entry.lockedUntil = now + LOGIN_LOCKOUT_MS;
+  }
+}
+
+function recordSuccessfulLogin(ip: string) {
+  loginAttempts.delete(ip);
+}
+
+function csrfGuard(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
+    return next();
+  }
+  const origin = (req.headers.origin ?? "").toString();
+  const referer = (req.headers.referer ?? "").toString();
+  const host = (req.headers.host ?? "").toString();
+  const expected = new Set<string>();
+  if (host) {
+    expected.add(`http://${host}`);
+    expected.add(`https://${host}`);
+  }
+  if (appOrigin) expected.add(appOrigin);
+
+  const fromOrigin = origin && [...expected].some((value) => origin === value);
+  const fromReferer = !origin && referer && [...expected].some((value) => referer.startsWith(`${value}/`) || referer === value);
+
+  if (fromOrigin || fromReferer) return next();
+  res.status(403).json({ error: "Cross-origin request rejected." });
+}
+
+async function processConcurrent<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<Array<{ ok: true; value: R } | { ok: false; error: Error }>> {
+  const results: Array<{ ok: true; value: R } | { ok: false; error: Error }> = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      try {
+        const value = await fn(items[index]);
+        results[index] = { ok: true, value };
+      } catch (error) {
+        results[index] = { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
+      }
+    }
+  }
+  const workerCount = Math.min(Math.max(1, limit), items.length || 1);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+function cleanupExpiredSessions() {
+  try {
+    db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now());
+  } catch (error) {
+    console.error("Session cleanup failed:", error);
+  }
+}
+cleanupExpiredSessions();
+setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
+
 function authUser(req: express.Request) {
   return (req as unknown as AuthedRequest).user;
 }
@@ -824,61 +980,72 @@ async function ingestAsset(userId: string, file: Express.Multer.File) {
   const ext = extensionFor(file.originalname, file.mimetype);
   const relativeDir = path.join("uploads", userId, id);
   const absoluteDir = path.join(dataDir, relativeDir);
-  await fs.mkdir(absoluteDir, { recursive: true });
+  let movedOriginal = false;
+  let absoluteOriginal = "";
 
-  const originalPath = path.join(relativeDir, `original${ext}`);
-  const previewPath = path.join(relativeDir, "preview.webp");
-  const thumbPath = path.join(relativeDir, "thumb.webp");
-  const absoluteOriginal = path.join(dataDir, originalPath);
-  await fs.rename(file.path, absoluteOriginal);
-
-  const image = sharp(absoluteOriginal).rotate();
-  const metadata = await image.metadata();
-  await sharp(absoluteOriginal)
-    .rotate()
-    .resize({ width: 1800, height: 1800, fit: "inside", withoutEnlargement: true })
-    .webp({ quality: 82 })
-    .toFile(path.join(dataDir, previewPath));
-  await sharp(absoluteOriginal)
-    .rotate()
-    .resize({ width: 560, height: 560, fit: "cover", position: "attention" })
-    .webp({ quality: 76 })
-    .toFile(path.join(dataDir, thumbPath));
-
-  const now = new Date().toISOString();
-  let takenAt = now;
   try {
-    const tags = await parseExif(absoluteOriginal, ["DateTimeOriginal", "CreateDate"]);
-    const exifDate = tags?.DateTimeOriginal ?? tags?.CreateDate;
-    if (exifDate instanceof Date && !isNaN(exifDate.getTime())) {
-      takenAt = exifDate.toISOString();
+    await fs.mkdir(absoluteDir, { recursive: true });
+
+    const originalPath = path.join(relativeDir, `original${ext}`);
+    const previewPath = path.join(relativeDir, "preview.webp");
+    const thumbPath = path.join(relativeDir, "thumb.webp");
+    absoluteOriginal = path.join(dataDir, originalPath);
+    await fs.rename(file.path, absoluteOriginal);
+    movedOriginal = true;
+
+    const metadata = await sharp(absoluteOriginal).rotate().metadata();
+    await sharp(absoluteOriginal)
+      .rotate()
+      .resize({ width: 1800, height: 1800, fit: "inside", withoutEnlargement: true })
+      .webp({ quality: 82 })
+      .toFile(path.join(dataDir, previewPath));
+    await sharp(absoluteOriginal)
+      .rotate()
+      .resize({ width: 560, height: 560, fit: "cover", position: "attention" })
+      .webp({ quality: 76 })
+      .toFile(path.join(dataDir, thumbPath));
+
+    const now = new Date().toISOString();
+    let takenAt = now;
+    try {
+      const tags = await parseExif(absoluteOriginal, ["DateTimeOriginal", "CreateDate"]);
+      const exifDate = tags?.DateTimeOriginal ?? tags?.CreateDate;
+      if (exifDate instanceof Date && !isNaN(exifDate.getTime())) {
+        takenAt = exifDate.toISOString();
+      }
+    } catch {
+      // no EXIF date available
     }
-  } catch {
-    // no EXIF date available
+
+    db.prepare(`
+      INSERT INTO assets (
+        id, user_id, original_name, mime_type, size_bytes, width, height,
+        taken_at, created_at, original_path, preview_path, thumb_path
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      userId,
+      file.originalname,
+      file.mimetype,
+      file.size,
+      metadata.width ?? null,
+      metadata.height ?? null,
+      takenAt,
+      now,
+      originalPath,
+      previewPath,
+      thumbPath
+    );
+
+    const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow;
+    return toPublicAsset(row);
+  } catch (error) {
+    await fs.rm(absoluteDir, { recursive: true, force: true }).catch(() => undefined);
+    if (!movedOriginal) {
+      await fs.rm(file.path, { force: true }).catch(() => undefined);
+    }
+    throw error;
   }
-
-  db.prepare(`
-    INSERT INTO assets (
-      id, user_id, original_name, mime_type, size_bytes, width, height,
-      taken_at, created_at, original_path, preview_path, thumb_path
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    userId,
-    file.originalname,
-    file.mimetype,
-    file.size,
-    metadata.width ?? null,
-    metadata.height ?? null,
-    takenAt,
-    now,
-    originalPath,
-    previewPath,
-    thumbPath
-  );
-
-  const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow;
-  return toPublicAsset(row);
 }
 
 function extensionFor(filename: string, mimeType: string) {
