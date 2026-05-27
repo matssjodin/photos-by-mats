@@ -1084,25 +1084,30 @@ button:disabled {
     display: block;
   }
 
+  /*
+   * Centering uses viewport units only — width:100vw / height:100vh
+   * are absolute lengths, so the box covers the visible viewport
+   * regardless of what containing block the browser uses for the
+   * fixed element (some ancestor creates a non-viewport CB here).
+   * object-fit:contain then centers the image inside the padded box.
+   */
   .viewer-image,
   .viewer-image.public {
     position: fixed;
     top: 0;
-    bottom: 0;
     left: 0;
-    right: 0;
-    margin: auto;
-    max-width: 96vw;
-    max-height: 88vh;
-    width: auto;
-    height: auto;
+    width: 100vw;
+    height: 100vh;
+    margin: 0;
+    padding: 72px 2vw 8px;
+    box-sizing: border-box;
+    max-width: none;
+    max-height: none;
     object-fit: contain;
   }
 
   .viewer.info-open .viewer-image {
-    top: 72px;
-    bottom: 32vh;
-    max-height: calc(68vh - 72px);
+    padding-bottom: 32vh;
   }
 
   .info-panel {

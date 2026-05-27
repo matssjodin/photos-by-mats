@@ -205,7 +205,8 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     const trashedAway = patch.trashed === true && view !== "trash";
     const archivedAway = patch.archived === true && view !== "archive";
     const untrashed = patch.trashed === false && view === "trash";
-    const removesFromView = trashedAway || archivedAway || untrashed;
+    const unarchived = patch.archived === false && view === "archive";
+    const removesFromView = trashedAway || archivedAway || untrashed || unarchived;
     if (removesFromView && selected?.id === data.asset.id) {
       setSelected(null);
     } else {
@@ -488,16 +489,21 @@ type ConfirmRequest = {
 
 function ConfirmDialog({ request, onClose }: { request: ConfirmRequest; onClose: () => void }) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   async function handleConfirm() {
     setBusy(true);
+    setError("");
     try {
       await request.onConfirm();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.");
     } finally {
       setBusy(false);
-      onClose();
     }
   }
   function handleCancel() {
+    if (busy) return;
     request.onCancel?.();
     onClose();
   }
@@ -508,8 +514,9 @@ function ConfirmDialog({ request, onClose }: { request: ConfirmRequest; onClose:
           <h2>{request.title}</h2>
         </div>
         {request.body && <p>{request.body}</p>}
+        {error && <p className="form-error">{error}</p>}
         <div className="modal-actions">
-          <button className="secondary-button" onClick={handleCancel} type="button">{request.cancelLabel ?? "Cancel"}</button>
+          <button className="secondary-button" disabled={busy} onClick={handleCancel} type="button">{request.cancelLabel ?? "Cancel"}</button>
           <button
             className={request.danger ? "danger-button" : "primary-button"}
             disabled={busy}
