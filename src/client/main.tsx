@@ -971,10 +971,22 @@ function ViewerStage({
   infoOpen?: boolean;
 }) {
   const imgRef = useRef<HTMLImageElement | null>(null);
-  const gesture = useRef<{ x: number; y: number; dx: number; dy: number } | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const swipe = useRef<{ x: number; y: number; dx: number; dy: number } | null>(null);
+  const pinch = useRef<{ distance: number; scale: number } | null>(null);
+  const zoom = useRef({ scale: 1, tx: 0, ty: 0 });
+  const lastTap = useRef<{ time: number; x: number; y: number } | null>(null);
   const justSwiped = useRef(false);
   useBodyScrollLock();
   useBackClose(true, onClose);
+
+  useEffect(() => {
+    setLoaded(false);
+    zoom.current = { scale: 1, tx: 0, ty: 0 };
+    pinch.current = null;
+    swipe.current = null;
+  }, [asset.id]);
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
@@ -995,16 +1007,102 @@ function ViewerStage({
     }
   }, [previous?.id, next?.id]);
 
-  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+  function applyZoom(animate = false) {
+    const img = imgRef.current;
+    if (!img) return;
+    const { scale, tx, ty } = zoom.current;
+    img.style.transition = animate ? "transform 180ms ease" : "none";
+    img.style.transform = scale === 1 && !tx && !ty ? "" : `translate(${tx}px, ${ty}px) scale(${scale})`;
+  }
+
+  function clampPan() {
+    const img = imgRef.current;
+    if (!img) return;
+    const maxX = ((zoom.current.scale - 1) * img.clientWidth) / 2;
+    const maxY = ((zoom.current.scale - 1) * img.clientHeight) / 2;
+    zoom.current.tx = Math.min(maxX, Math.max(-maxX, zoom.current.tx));
+    zoom.current.ty = Math.min(maxY, Math.max(-maxY, zoom.current.ty));
+  }
+
+  function toggleZoom(focusX: number, focusY: number) {
+    const img = imgRef.current;
+    if (!img) return;
+    if (zoom.current.scale > 1) {
+      zoom.current = { scale: 1, tx: 0, ty: 0 };
+    } else {
+      const rect = img.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const scale = 2.5;
+      // Keep the tapped point stationary: with origin center, p maps to
+      // c + (p - c) * s + t, so t = (p - c) * (1 - s) holds it in place.
+      zoom.current = { scale, tx: (focusX - centerX) * (1 - scale), ty: (focusY - centerY) * (1 - scale) };
+      clampPan();
+    }
+    applyZoom(true);
+  }
+
+  function handleDoubleTapCandidate(event: React.PointerEvent) {
     if (event.pointerType === "mouse") return;
+    const now = Date.now();
+    const last = lastTap.current;
+    lastTap.current = { time: now, x: event.clientX, y: event.clientY };
+    if (last && now - last.time < 300 && Math.hypot(event.clientX - last.x, event.clientY - last.y) < 40) {
+      lastTap.current = null;
+      justSwiped.current = true;
+      toggleZoom(event.clientX, event.clientY);
+    }
+  }
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
     // Pointer capture would redirect the eventual click away from toolbar
     // buttons, so gestures rely on bubbling instead — and never start on one.
     if ((event.target as HTMLElement).closest("button")) return;
-    gesture.current = { x: event.clientX, y: event.clientY, dx: 0, dy: 0 };
+    if (event.pointerType === "mouse" && zoom.current.scale === 1) return;
+    pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pointers.current.size === 2) {
+      const [first, second] = [...pointers.current.values()];
+      pinch.current = { distance: Math.hypot(first.x - second.x, first.y - second.y), scale: zoom.current.scale };
+      swipe.current = null;
+      applyZoom();
+    } else if (pointers.current.size === 1 && zoom.current.scale === 1) {
+      swipe.current = { x: event.clientX, y: event.clientY, dx: 0, dy: 0 };
+    }
   }
 
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
-    const current = gesture.current;
+    const tracked = pointers.current.get(event.pointerId);
+    if (!tracked) return;
+    const previousX = tracked.x;
+    const previousY = tracked.y;
+    tracked.x = event.clientX;
+    tracked.y = event.clientY;
+
+    if (pinch.current && pointers.current.size >= 2) {
+      const [first, second] = [...pointers.current.values()];
+      const distance = Math.hypot(first.x - second.x, first.y - second.y);
+      if (!distance || !pinch.current.distance) return;
+      const nextScale = Math.min(4, Math.max(1, (pinch.current.scale * distance) / pinch.current.distance));
+      const ratio = nextScale / zoom.current.scale;
+      zoom.current.scale = nextScale;
+      zoom.current.tx *= ratio;
+      zoom.current.ty *= ratio;
+      clampPan();
+      applyZoom();
+      justSwiped.current = true;
+      return;
+    }
+
+    if (zoom.current.scale > 1 && pointers.current.size === 1) {
+      zoom.current.tx += event.clientX - previousX;
+      zoom.current.ty += event.clientY - previousY;
+      clampPan();
+      applyZoom();
+      justSwiped.current = true;
+      return;
+    }
+
+    const current = swipe.current;
     const img = imgRef.current;
     if (!current || !img) return;
     current.dx = event.clientX - current.x;
@@ -1018,12 +1116,34 @@ function ViewerStage({
     }
   }
 
-  function handlePointerEnd() {
-    const current = gesture.current;
-    gesture.current = null;
+  function handlePointerEnd(event: React.PointerEvent<HTMLDivElement>) {
+    const wasTracked = pointers.current.delete(event.pointerId);
+
+    if (pinch.current) {
+      if (pointers.current.size < 2) {
+        pinch.current = null;
+        if (zoom.current.scale < 1.05) {
+          zoom.current = { scale: 1, tx: 0, ty: 0 };
+          applyZoom(true);
+        }
+      }
+      return;
+    }
+
+    if (zoom.current.scale > 1) {
+      if (wasTracked && !justSwiped.current) handleDoubleTapCandidate(event);
+      return;
+    }
+
+    const current = swipe.current;
+    swipe.current = null;
     const img = imgRef.current;
-    if (!current || !img) return;
+    if (!current || !img) {
+      if (wasTracked) handleDoubleTapCandidate(event);
+      return;
+    }
     justSwiped.current = Math.hypot(current.dx, current.dy) > 10;
+    if (!justSwiped.current) handleDoubleTapCandidate(event);
     const horizontal = Math.abs(current.dx) >= Math.abs(current.dy);
     if (horizontal && current.dx <= -SWIPE_NAVIGATE_THRESHOLD && next) {
       onSelect(next);
@@ -1068,11 +1188,16 @@ function ViewerStage({
               <ChevronLeft size={28} />
             </button>
           )}
+          {!loaded && (
+            <img alt="" aria-hidden className="viewer-backdrop" draggable={false} key={`backdrop-${asset.id}`} src={asset.urls.thumb} />
+          )}
           <img
             alt={asset.originalName}
-            className="viewer-image"
+            className={loaded ? "viewer-image" : "viewer-image loading"}
             draggable={false}
             key={asset.id}
+            onDoubleClick={(event) => toggleZoom(event.clientX, event.clientY)}
+            onLoad={() => setLoaded(true)}
             ref={imgRef}
             src={asset.urls.preview}
           />

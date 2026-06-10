@@ -865,6 +865,22 @@ button:disabled {
   -webkit-user-select: none;
 }
 
+/* Until the preview arrives, the cached thumbnail fills the stage as a blur. */
+.viewer-image.loading {
+  opacity: 0;
+}
+
+.viewer-backdrop {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  filter: blur(22px) brightness(0.7);
+  transform: scale(1.06);
+  pointer-events: none;
+}
+
 .viewer-topbar {
   position: absolute;
   top: 0;
