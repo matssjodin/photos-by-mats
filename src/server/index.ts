@@ -167,6 +167,7 @@ db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_share_token ON albums(shar
 ensureColumn("albums", "cover_asset_id", "TEXT");
 ensureAdminAccount();
 
+app.use(securityHeaders);
 app.use(express.json({ limit: "1mb" }));
 app.use(csrfGuard);
 
@@ -215,7 +216,7 @@ app.get("/api/share/:token/file/:assetId/:variant", (req, res) => {
     return;
   }
 
-  res.sendFile(path.join(dataDir, variant === "thumb" ? asset.thumb_path : asset.preview_path));
+  sendAssetFile(res, variant === "thumb" ? asset.thumb_path : asset.preview_path);
 });
 
 app.post("/api/auth/login", (req, res) => {
@@ -466,7 +467,7 @@ app.get("/api/assets/:id/file/:variant", (req, res) => {
   if (variant === "original") {
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(asset.original_name)}"`);
   }
-  res.sendFile(path.join(dataDir, relPath));
+  sendAssetFile(res, relPath);
 });
 
 app.patch("/api/assets/:id", (req, res) => {
@@ -882,6 +883,20 @@ function recordSuccessfulLogin(ip: string) {
   loginAttempts.delete(ip);
 }
 
+function securityHeaders(_req: express.Request, res: express.Response, next: express.NextFunction) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+  );
+  if (isProduction) {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  next();
+}
+
 function csrfGuard(req: express.Request, res: express.Response, next: express.NextFunction) {
   if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
     return next();
@@ -1056,6 +1071,19 @@ function extensionFor(filename: string, mimeType: string) {
   if (mimeType === "image/gif") return ".gif";
   if (mimeType === "image/avif") return ".avif";
   return ".jpg";
+}
+
+function sendAssetFile(res: express.Response, relPath: string) {
+  // Variant files never change for a given asset id, so they can be cached hard.
+  res.sendFile(
+    path.join(dataDir, relPath),
+    { headers: { "Cache-Control": "private, max-age=31536000, immutable" } },
+    (error) => {
+      if (error && !res.headersSent) {
+        res.status(404).json({ error: "File not found." });
+      }
+    }
+  );
 }
 
 function findOwnedAsset(assetId: string, user: PublicUser) {
