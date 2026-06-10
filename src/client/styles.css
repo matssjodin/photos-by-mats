@@ -522,7 +522,113 @@ button:disabled {
 
 .select-bar-actions {
   display: flex;
+  gap: 2px;
+}
+
+.select-count {
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.icon-button.bar {
+  width: 42px;
+  height: 42px;
+  color: #fff;
+  background: transparent;
+}
+
+.icon-button.bar:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.icon-button.bar.danger {
+  color: #ffb4a8;
+}
+
+/* ---------- Upload progress ---------- */
+
+.upload-progress {
+  position: fixed;
+  left: 10px;
+  right: 10px;
+  bottom: calc(var(--bottom-nav-h) + var(--safe-bottom) + 10px);
+  z-index: 46;
+  display: grid;
   gap: 8px;
+  padding: 14px;
+  border-radius: 14px;
+  background: #102a2a;
+  color: white;
+  box-shadow: var(--shadow);
+}
+
+.upload-progress span {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.upload-progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  overflow: hidden;
+}
+
+.upload-progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: #57c4bb;
+  transition: width 200ms ease;
+}
+
+/* ---------- Album pick modal ---------- */
+
+.album-pick-list {
+  display: grid;
+  gap: 8px;
+  max-height: 40vh;
+  max-height: 40dvh;
+  overflow-y: auto;
+}
+
+.album-pick-list button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 48px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  text-align: left;
+}
+
+.album-pick-list button span {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.album-pick-empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+.album-pick-create {
+  display: flex;
+  gap: 8px;
+}
+
+.album-pick-create input {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  outline: none;
 }
 
 /* ---------- Empty / splash / login ---------- */
@@ -1293,6 +1399,13 @@ button:disabled {
     left: 296px;
     right: 16px;
     bottom: 16px;
+  }
+
+  .upload-progress {
+    left: auto;
+    right: 22px;
+    bottom: 22px;
+    width: 360px;
   }
 
   .empty-state h2 {

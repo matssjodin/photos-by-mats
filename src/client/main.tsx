@@ -6,12 +6,15 @@ import {
   Camera,
   ChevronLeft,
   ChevronRight,
+  Download,
+  FolderPlus,
   Heart,
   ImagePlus,
   Images,
   Info,
   LogOut,
   Plus,
+  RotateCcw,
   Search,
   Shield,
   Sparkles,
@@ -114,6 +117,8 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [uploadState, setUploadState] = useState<{ count: number; percent: number; processing: boolean } | null>(null);
+  const [albumPickOpen, setAlbumPickOpen] = useState(false);
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>([]);
   const [confirmState, setConfirmState] = useState<ConfirmRequest | null>(null);
@@ -129,11 +134,20 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   // The viewer's "Add to album" list needs albums before the Albums tab is visited.
   useEffect(() => {
     void loadAlbums();
+    // Landing back from the share-target service worker flow.
+    const params = new URLSearchParams(window.location.search);
+    if (params.has("shared")) {
+      setMessage(params.get("shared") === "1" ? "Shared photos added to your library" : "Could not add the shared photos");
+      window.history.replaceState(null, "", "/");
+    }
   }, []);
 
   function confirmAction(request: ConfirmRequest) {
     setConfirmState(request);
   }
+
+  // Browser/hardware back leaves an open album before leaving the app.
+  useBackClose(Boolean(activeAlbum), () => setActiveAlbum(null));
 
   const visibleAssets = useMemo(() => {
     if (!search.trim()) return assets;
@@ -184,15 +198,23 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
 
   async function uploadPhotos(files: FileList | File[] | null, albumId = activeAlbum?.id) {
     if (!files?.length) return;
+    const list = Array.from(files);
     const form = new FormData();
-    Array.from(files).forEach((file) => form.append("photos", file));
+    list.forEach((file) => form.append("photos", file));
     setBusy(true);
-    setMessage("Uploading");
+    setUploadState({ count: list.length, percent: 0, processing: false });
     try {
       const endpoint = albumId ? `/api/albums/${albumId}/upload` : "/api/assets";
-      const response = await fetch(endpoint, { method: "POST", body: form });
-      if (!response.ok) throw new Error((await response.json()).error ?? "Upload failed.");
-      setMessage("");
+      const result = await uploadWithProgress(endpoint, form, (percent) =>
+        setUploadState({ count: list.length, percent, processing: percent >= 100 })
+      );
+      const added = result.assets.length;
+      const skipped = result.duplicates?.length ?? 0;
+      const failed = result.errors.length;
+      const parts = [`Added ${added} photo${added === 1 ? "" : "s"}`];
+      if (skipped) parts.push(`skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}`);
+      if (failed) parts.push(`${failed} failed`);
+      setMessage(parts.join(", "));
       if (albumId) {
         await loadAlbumAssets(albumId);
         await loadAlbums();
@@ -204,6 +226,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
       setMessage(error instanceof Error ? error.message : "Upload failed.");
     } finally {
       setBusy(false);
+      setUploadState(null);
       if (fileInput.current) fileInput.current.value = "";
     }
   }
@@ -321,14 +344,88 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     setSelectedIds(new Set());
   }
 
-  async function trashSelected() {
+  async function bulkPatch(patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>, note: string) {
     const ids = [...selectedIds];
+    if (!ids.length) return;
     clearSelect();
-    await Promise.all(ids.map((id) =>
-      api(`/api/assets/${id}`, { method: "PATCH", body: JSON.stringify({ trashed: true }) })
-    ));
-    setAssets((current) => current.filter((a) => !ids.includes(a.id)));
-    void loadAlbums();
+    setBusy(true);
+    try {
+      await Promise.all(ids.map((id) =>
+        api(`/api/assets/${id}`, { method: "PATCH", body: JSON.stringify(patch) })
+      ));
+      setMessage(note);
+      if (activeAlbum) await loadAlbumAssets(activeAlbum.id);
+      else await loadAssets(view);
+      void loadAlbums();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Something went wrong.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function bulkDelete() {
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    confirmAction({
+      title: `Delete ${ids.length} photo${ids.length === 1 ? "" : "s"} permanently?`,
+      body: "This removes originals, previews, and thumbnails from disk. It cannot be undone.",
+      confirmLabel: "Delete permanently",
+      danger: true,
+      onConfirm: async () => {
+        clearSelect();
+        await Promise.all(ids.map((id) => api(`/api/assets/${id}`, { method: "DELETE" })));
+        await loadAssets(view);
+        void loadAlbums();
+      }
+    });
+  }
+
+  async function bulkDownload() {
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    setMessage("Preparing download");
+    try {
+      const response = await fetch("/api/assets/zip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assetIds: ids })
+      });
+      if (!response.ok) throw new Error("Download failed.");
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "photos.zip";
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      setMessage("");
+      clearSelect();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Download failed.");
+    }
+  }
+
+  async function bulkAddToAlbum(albumId: string) {
+    const ids = [...selectedIds];
+    setAlbumPickOpen(false);
+    clearSelect();
+    await addToAlbum(albumId, ids);
+    const album = albums.find((item) => item.id === albumId);
+    setMessage(album ? `Added to ${album.title}` : "Added to album");
+  }
+
+  async function bulkCreateAlbumAndAdd(title: string) {
+    const ids = [...selectedIds];
+    setAlbumPickOpen(false);
+    clearSelect();
+    const data = await api<{ album: Album }>("/api/albums", {
+      method: "POST",
+      body: JSON.stringify({ title })
+    });
+    setAlbums((current) => [data.album, ...current]);
+    await addToAlbum(data.album.id, ids);
+    setMessage(`Added to ${data.album.title}`);
   }
 
   function handleDrop(event: React.DragEvent<HTMLElement>) {
@@ -454,13 +551,11 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
               busy={busy}
               onAddExisting={openAddModal}
               onBack={() => setActiveAlbum(null)}
-              onClearSelect={clearSelect}
               onSelect={setSelected}
               onSetCover={activeAlbum ? setCoverPhoto : undefined}
               onShare={shareAlbum}
               onStartSelect={startSelect}
               onToggleSelect={toggleSelect}
-              onTrashSelected={trashSelected}
               onUpload={() => fileInput.current?.click()}
               selectMode={selectMode}
               selectedIds={selectedIds}
@@ -470,6 +565,59 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
       </main>
 
       {message && <Overlay><div className="toast">{message}</div></Overlay>}
+
+      {uploadState && (
+        <Overlay>
+          <div className="upload-progress" role="status">
+            <div className="upload-progress-track">
+              <div className="upload-progress-bar" style={{ width: `${uploadState.percent}%` }} />
+            </div>
+            <span>
+              {uploadState.processing
+                ? "Processing photos…"
+                : `Uploading ${uploadState.count} photo${uploadState.count === 1 ? "" : "s"} — ${uploadState.percent}%`}
+            </span>
+          </div>
+        </Overlay>
+      )}
+
+      {selectMode && (
+        <Overlay>
+          <div className="select-bar">
+            <span className="select-count">{selectedIds.size} selected</span>
+            <div className="select-bar-actions">
+              {view === "trash" ? (
+                <>
+                  <button className="icon-button bar" disabled={!selectedIds.size} onClick={() => void bulkPatch({ trashed: false }, "Restored")} title="Restore" type="button"><RotateCcw size={20} /></button>
+                  <button className="icon-button bar danger" disabled={!selectedIds.size} onClick={bulkDelete} title="Delete permanently" type="button"><Trash2 size={20} /></button>
+                </>
+              ) : (
+                <>
+                  <button className="icon-button bar" disabled={!selectedIds.size} onClick={() => setAlbumPickOpen(true)} title="Add to album" type="button"><FolderPlus size={20} /></button>
+                  <button className="icon-button bar" disabled={!selectedIds.size} onClick={() => void bulkPatch({ favorite: true }, "Added to favorites")} title="Favorite" type="button"><Heart size={20} /></button>
+                  {view === "archive" ? (
+                    <button className="icon-button bar" disabled={!selectedIds.size} onClick={() => void bulkPatch({ archived: false }, "Unarchived")} title="Unarchive" type="button"><Archive size={20} /></button>
+                  ) : (
+                    <button className="icon-button bar" disabled={!selectedIds.size} onClick={() => void bulkPatch({ archived: true }, "Archived")} title="Archive" type="button"><Archive size={20} /></button>
+                  )}
+                  <button className="icon-button bar" disabled={!selectedIds.size} onClick={() => void bulkDownload()} title="Download" type="button"><Download size={20} /></button>
+                  <button className="icon-button bar danger" disabled={!selectedIds.size} onClick={() => void bulkPatch({ trashed: true }, "Moved to trash")} title="Trash" type="button"><Trash2 size={20} /></button>
+                </>
+              )}
+              <button className="icon-button bar" onClick={clearSelect} title="Done" type="button"><X size={20} /></button>
+            </div>
+          </div>
+        </Overlay>
+      )}
+
+      {albumPickOpen && (
+        <AlbumPickModal
+          albums={albums}
+          onClose={() => setAlbumPickOpen(false)}
+          onCreateAndAdd={bulkCreateAlbumAndAdd}
+          onPick={bulkAddToAlbum}
+        />
+      )}
 
       {addModalOpen && activeAlbum && (
         <AddExistingModal
@@ -520,6 +668,89 @@ function useBodyScrollLock() {
       document.body.style.overflow = previous;
     };
   }, []);
+}
+
+/**
+ * Hardware/browser back closes the topmost open overlay (viewer, album,
+ * modal) instead of leaving the app. Each open overlay pushes one history
+ * entry; the global popstate handler closes the top of the stack, and
+ * closing through the UI consumes the matching entry with history.back().
+ */
+const overlayStack: Array<() => void> = [];
+let suppressPops = 0;
+window.addEventListener("popstate", () => {
+  if (suppressPops > 0) {
+    suppressPops -= 1;
+    return;
+  }
+  overlayStack.pop()?.();
+});
+
+function useBackClose(open: boolean, onClose: () => void) {
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const entry = () => closeRef.current();
+    overlayStack.push(entry);
+    history.pushState({ overlay: true }, "");
+    return () => {
+      const index = overlayStack.indexOf(entry);
+      if (index !== -1) {
+        // Closed through the UI — consume the history entry we pushed.
+        overlayStack.splice(index, 1);
+        suppressPops += 1;
+        history.back();
+      }
+    };
+  }, [open]);
+}
+
+function AlbumPickModal({
+  albums,
+  onClose,
+  onCreateAndAdd,
+  onPick
+}: {
+  albums: Album[];
+  onClose: () => void;
+  onCreateAndAdd: (title: string) => Promise<void>;
+  onPick: (albumId: string) => Promise<void>;
+}) {
+  const [title, setTitle] = useState("");
+  useBodyScrollLock();
+  useBackClose(true, onClose);
+  return (
+    <Overlay>
+      <div className="modal-backdrop" onClick={onClose}>
+        <section className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-head">
+            <h2>Add to album</h2>
+            <button className="icon-button" onClick={onClose} title="Close" type="button"><X size={18} /></button>
+          </div>
+          <div className="album-pick-list">
+            {albums.map((album) => (
+              <button key={album.id} onClick={() => void onPick(album.id)} type="button">
+                <strong>{album.title}</strong>
+                <span>{album.assetCount} item{album.assetCount === 1 ? "" : "s"}</span>
+              </button>
+            ))}
+            {!albums.length && <p className="album-pick-empty">No albums yet — create one below.</p>}
+          </div>
+          <form
+            className="album-pick-create"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (title.trim()) void onCreateAndAdd(title.trim());
+            }}
+          >
+            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="New album" />
+            <button className="primary-button" disabled={!title.trim()} type="submit">Create</button>
+          </form>
+        </section>
+      </div>
+    </Overlay>
+  );
 }
 
 type ConfirmRequest = {
@@ -743,6 +974,7 @@ function ViewerStage({
   const gesture = useRef<{ x: number; y: number; dx: number; dy: number } | null>(null);
   const justSwiped = useRef(false);
   useBodyScrollLock();
+  useBackClose(true, onClose);
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
@@ -972,13 +1204,11 @@ function LibraryView({
   busy,
   onAddExisting,
   onBack,
-  onClearSelect = () => {},
   onSelect,
   onSetCover,
   onShare,
   onStartSelect = () => {},
   onToggleSelect = () => {},
-  onTrashSelected = async () => {},
   onUpload,
   selectMode = false,
   selectedIds = new Set<string>(),
@@ -988,13 +1218,11 @@ function LibraryView({
   busy: boolean;
   onAddExisting: () => void;
   onBack: () => void;
-  onClearSelect?: () => void;
   onSelect: (asset: Asset) => void;
   onSetCover?: (albumId: string, assetId: string) => Promise<void>;
   onShare: (album: Album) => Promise<void>;
   onStartSelect?: (id: string) => void;
   onToggleSelect?: (id: string) => void;
-  onTrashSelected?: () => Promise<void>;
   onUpload: () => void;
   selectMode?: boolean;
   selectedIds?: Set<string>;
@@ -1116,19 +1344,6 @@ function LibraryView({
           </div>
         ))}
       </section>
-      {selectMode && (
-        <Overlay>
-          <div className="select-bar">
-            <span>{selectedIds.size} photo{selectedIds.size === 1 ? "" : "s"} selected</span>
-            <div className="select-bar-actions">
-              <button className="secondary-button" onClick={onClearSelect} type="button">Cancel</button>
-              <button className="danger-button" disabled={selectedIds.size === 0} onClick={() => void onTrashSelected()} type="button">
-                <Trash2 size={18} /><span>Trash</span>
-              </button>
-            </div>
-          </div>
-        </Overlay>
-      )}
     </>
   );
 }
@@ -1279,6 +1494,7 @@ function AddExistingModal({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const candidates = assets.filter((asset) => !existingIds.has(asset.id));
   useBodyScrollLock();
+  useBackClose(true, onClose);
 
   async function submit() {
     if (!selectedIds.length) return;
@@ -1461,6 +1677,31 @@ function Splash() {
       <div className="brand-mark"><Camera size={28} /></div>
     </div>
   );
+}
+
+type UploadResult = {
+  assets: Asset[];
+  duplicates?: Asset[];
+  errors: Array<{ name: string; error: string }>;
+};
+
+function uploadWithProgress(url: string, form: FormData, onProgress: (percent: number) => void): Promise<UploadResult> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.responseType = "json";
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+    });
+    xhr.addEventListener("load", () => {
+      const body = xhr.response as (UploadResult & { error?: string }) | null;
+      if (xhr.status >= 200 && xhr.status < 300 && body) resolve(body);
+      else reject(new Error(body?.error || `Upload failed with ${xhr.status}.`));
+    });
+    xhr.addEventListener("error", () => reject(new Error("Upload failed.")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
+    xhr.send(form);
+  });
 }
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
