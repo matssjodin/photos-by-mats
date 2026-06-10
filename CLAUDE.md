@@ -31,6 +31,10 @@ npm run typecheck
 
 # Smoke/integration tests (boots the real server against a temp DATA_DIR)
 npm test
+
+# Visual smoke check (requires a prior `npm run build`; uses local Edge headless,
+# seeds demo data, writes mobile + desktop screenshots to verify-shots/)
+node scripts/visual-check.mjs
 ```
 
 `tests/smoke.test.ts` runs with Node's built-in test runner via `tsx` and covers auth, CSRF, uploads, sharing, and admin authorization. CI (`.github/workflows/ci.yml`) runs typecheck, build, test, and a production-dependency audit on every push and PR.
@@ -42,6 +46,8 @@ This is a single-repo fullstack photo management app with two separate TypeScrip
 **Server** (`src/server/index.ts`) — single-file Express 5 app compiled with `tsconfig.server.json` (NodeNext modules) to `dist-server/`. It uses Node's built-in `node:sqlite` (`DatabaseSync`) — no ORM, no migration framework, just inline SQL with schema creation and `ensureColumn()` for additive migrations. All business logic, auth, and file handling live in this one file.
 
 **Client** (`src/client/main.tsx`) — single-file React 19 SPA compiled by Vite to `dist-client/`. All components, state, and API calls are in this one file. No routing library; view switching is handled by a `View` state enum. The `api<T>()` helper at the bottom wraps `fetch` with JSON error handling.
+
+The UI is mobile-first: `styles.css` defines the phone layout (bottom tab bar, bottom-sheet modals/info panel) as the default and a single `@media (min-width: 900px)` block switches to the desktop layout (sidebar, centered dialogs, docked info panel). The photo viewer and all overlays render through the `Overlay` portal to `document.body` so `position: fixed` always anchors to the viewport — do not render overlays inline, and do not add `transform`/`backdrop-filter` styles to overlay ancestors. The viewer supports swipe left/right (navigate) and swipe down (close) on touch devices.
 
 In production, the Express server serves `dist-client/` as static files and catches all non-API routes with an `index.html` fallback (SPA pattern). In development, Vite proxies `/api/*` to Express on `:4000`.
 

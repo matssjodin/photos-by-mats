@@ -98,8 +98,9 @@ Severity: CRITICAL / HIGH / MEDIUM / LOW. Status: FIXED / BACKLOG / DECISION (ne
 | U2 | MEDIUM | Admin panel `updateUser`/role/disable actions have no error handling — a failed request rejects unhandled with zero UI feedback. | FIXED |
 | U3 | LOW | No favicon, no meta description; private app should also be `noindex`. | FIXED |
 | U4 | LOW | If the session expires while the tab is open, API calls fail with toast errors instead of returning to the login screen. | FIXED (auto-return to login on 401) |
-| U5 | LOW | Album-cover star on tiles is a `span role="button"` nested in a button — not keyboard accessible. Several icon buttons rely on `title` only (acceptable; titles present). | BACKLOG (minor a11y) |
-| U6 | LOW | Long-press to multi-select is 3000 ms — unusually long (platform norm ~500 ms). Left as-is: recent deliberate commit by owner. | DECISION |
+| U5 | LOW | Album-cover star on tiles is a `span role="button"` nested in a button — not keyboard accessible. Several icon buttons rely on `title` only (acceptable; titles present). | FIXED (2026-06-10 frontend rebuild: keyboard handler + visible on touch) |
+| U6 | LOW | Long-press to multi-select is 3000 ms — unusually long (platform norm ~500 ms). | FIXED (2026-06-10 frontend rebuild: 500 ms + movement tolerance + explicit Select button) |
+| U8 | — | 2026-06-10: frontend rebuilt mobile-first at owner's request. Viewer rebuilt on a portal + flexbox stage (root-causes the repeated mobile-centering bug), swipe gestures, bottom tab bar, bottom-sheet info/modals, safe-area insets, iOS input-zoom fix, body scroll locking. Verified via `scripts/visual-check.mjs` headless-Edge screenshots. | DONE |
 | U7 | — | Loading skeletons, empty states, error states, confirm dialogs, drag-drop, keyboard nav in viewer all present. UI quality is high. | n/a |
 
 ### Code quality & testing
