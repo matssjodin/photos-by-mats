@@ -9,6 +9,7 @@
     "dev:web": "vite --host 0.0.0.0",
     "build": "tsc -p tsconfig.server.json && vite build",
     "start": "node dist-server/index.js",
+    "test": "node --import tsx --test tests/smoke.test.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
   },
   "dependencies": {
