@@ -787,6 +787,12 @@ app.use("/api", (_req, res) => {
   res.status(404).json({ error: "Endpoint not found." });
 });
 
+// PWA share-target fallback: if the service worker didn't intercept the POST
+// (first visit, SW disabled), bounce to the app instead of a 404.
+app.post("/share-target", (_req, res) => {
+  res.redirect(303, "/");
+});
+
 app.use(express.static(clientDir));
 app.get(/.*/, async (_req, res) => {
   res.sendFile(path.join(clientDir, "index.html"));
