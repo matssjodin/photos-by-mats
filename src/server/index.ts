@@ -1,3 +1,4 @@
+import { ZipArchive } from "archiver";
 import cookie from "cookie";
 import express from "express";
 import multer from "multer";
@@ -534,6 +535,42 @@ app.delete("/api/assets/:id", async (req, res) => {
 
   await deleteAssetCompletely(asset);
   res.json({ ok: true });
+});
+
+app.post("/api/assets/zip", (req, res) => {
+  const user = authUser(req);
+  const { assetIds } = req.body as { assetIds?: string[] };
+  const ids = Array.isArray(assetIds) ? assetIds.slice(0, 500).map(String) : [];
+  const assets = ids
+    .map((id) => findOwnedAsset(id, user))
+    .filter((asset): asset is AssetRow => Boolean(asset));
+  if (!assets.length) {
+    res.status(404).json({ error: "No matching photos." });
+    return;
+  }
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", 'attachment; filename="photos.zip"');
+
+  // Store-only: the originals are already compressed image formats.
+  const archive = new ZipArchive({ store: true });
+  archive.on("error", (error: Error) => {
+    console.error("Zip stream failed:", error);
+    res.destroy();
+  });
+  archive.pipe(res);
+
+  const usedNames = new Set<string>();
+  for (const asset of assets) {
+    let name = asset.original_name || `photo${path.extname(asset.original_path)}`;
+    if (usedNames.has(name)) {
+      const ext = path.extname(name);
+      name = `${name.slice(0, name.length - ext.length)}-${asset.id.slice(0, 8)}${ext}`;
+    }
+    usedNames.add(name);
+    archive.file(path.join(dataDir, asset.original_path), { name });
+  }
+  void archive.finalize();
 });
 
 app.get("/api/albums", (req, res) => {

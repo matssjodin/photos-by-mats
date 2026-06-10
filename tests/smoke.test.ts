@@ -262,6 +262,29 @@ test("re-uploading an identical image is reported as a duplicate, not stored twi
   assert.equal(second.duplicates[0].id, first.assets[0].id);
 });
 
+test("zip download streams owned originals and ignores foreign ids", async () => {
+  const list = await fetch(`${baseUrl}/api/assets?view=photos`, { headers: authedHeaders() });
+  const { assets } = await list.json() as { assets: Array<{ id: string }> };
+  assert.ok(assets.length >= 1);
+
+  const response = await fetch(`${baseUrl}/api/assets/zip`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ assetIds: [assets[0].id, "not-someones-real-id"] })
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/zip");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  assert.equal(String.fromCharCode(bytes[0], bytes[1]), "PK", "response should be a zip archive");
+
+  const empty = await fetch(`${baseUrl}/api/assets/zip`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ assetIds: ["nothing-owned"] })
+  });
+  assert.equal(empty.status, 404);
+});
+
 test("re-uploading a trashed duplicate restores it", async () => {
   const png = await makePng({ r: 10, g: 120, b: 200 });
   const listBefore = await fetch(`${baseUrl}/api/assets?view=photos`, { headers: authedHeaders() });
