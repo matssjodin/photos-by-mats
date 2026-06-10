@@ -125,13 +125,13 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   }
 
   const visibleAssets = useMemo(() => {
-    if (!search.trim() || activeAlbum) return assets;
+    if (!search.trim()) return assets;
     const query = search.toLowerCase();
     return assets.filter((asset) =>
       asset.originalName.toLowerCase().includes(query) ||
       prettyDate(asset.takenAt).toLowerCase().includes(query)
     );
-  }, [assets, search, activeAlbum]);
+  }, [assets, search]);
 
   useEffect(() => {
     setSelectedIds(new Set());
@@ -392,7 +392,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter") void loadAssets(view);
+                    if (event.key === "Enter" && !activeAlbum) void loadAssets(view);
                   }}
                   placeholder="Search"
                 />
@@ -1179,17 +1179,27 @@ function AdminPanel({ currentUser }: { currentUser: User }) {
   }
 
   async function updateUser(user: User, patch: Partial<User> & { password?: string }) {
-    await api(`/api/admin/users/${user.id}`, {
-      method: "PATCH",
-      body: JSON.stringify(patch)
-    });
+    setError("");
+    try {
+      await api(`/api/admin/users/${user.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update user.");
+    }
     await loadUsers();
   }
 
   async function deleteUser(user: User) {
     const confirmed = window.confirm(`Delete ${user.email}? This permanently removes the account and all photos.`);
     if (!confirmed) return;
-    await api(`/api/admin/users/${user.id}`, { method: "DELETE" });
+    setError("");
+    try {
+      await api(`/api/admin/users/${user.id}`, { method: "DELETE" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete user.");
+    }
     await loadUsers();
   }
 
@@ -1276,6 +1286,10 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
     }
   });
   if (!response.ok) {
+    if (response.status === 401 && url !== "/api/me" && !url.startsWith("/api/auth/")) {
+      // Session expired while the app was open — reload lands on the login screen.
+      window.location.reload();
+    }
     const contentType = response.headers.get("content-type") ?? "";
     if (contentType.includes("application/json")) {
       const error = await response.json().catch(() => ({ error: "" }));
