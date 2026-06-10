@@ -26,6 +26,7 @@ const maxUploadFileSizeMb = Number(process.env.MAX_UPLOAD_FILE_SIZE_MB ?? 120);
 const isProduction = process.env.NODE_ENV === "production";
 const appOrigin = process.env.APP_ORIGIN?.replace(/\/$/, "");
 const ingestConcurrency = Math.max(1, Number(process.env.INGEST_CONCURRENCY ?? 3));
+const trashRetentionDays = Number(process.env.TRASH_RETENTION_DAYS ?? 30);
 
 const loginAttempts = new Map<string, { count: number; firstAttempt: number; lockedUntil: number }>();
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -60,6 +61,7 @@ type AssetRow = {
   favorite: number;
   archived: number;
   trashed: number;
+  trashed_at: string | null;
   original_path: string;
   preview_path: string;
   thumb_path: string;
@@ -174,6 +176,9 @@ db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_share_token ON albums(shar
 ensureColumn("albums", "cover_asset_id", "TEXT");
 ensureColumn("assets", "content_hash", "TEXT");
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_user_hash ON assets(user_id, content_hash) WHERE content_hash IS NOT NULL");
+ensureColumn("assets", "trashed_at", "TEXT");
+// Photos trashed before this column existed start their retention clock now.
+db.prepare("UPDATE assets SET trashed_at = ? WHERE trashed = 1 AND trashed_at IS NULL").run(new Date().toISOString());
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_assets_user ON assets(user_id, trashed, archived);
   CREATE INDEX IF NOT EXISTS idx_albums_user ON albums(user_id);
@@ -502,14 +507,16 @@ app.patch("/api/assets/:id", (req, res) => {
     trashed?: boolean;
   };
 
+  const nextTrashed = typeof trashed === "boolean" ? Number(trashed) : asset.trashed;
   db.prepare(`
     UPDATE assets
-    SET favorite = ?, archived = ?, trashed = ?
+    SET favorite = ?, archived = ?, trashed = ?, trashed_at = ?
     WHERE id = ?
   `).run(
     typeof favorite === "boolean" ? Number(favorite) : asset.favorite,
     typeof archived === "boolean" ? Number(archived) : asset.archived,
-    typeof trashed === "boolean" ? Number(trashed) : asset.trashed,
+    nextTrashed,
+    nextTrashed ? (asset.trashed_at ?? new Date().toISOString()) : null,
     asset.id
   );
 
@@ -525,9 +532,7 @@ app.delete("/api/assets/:id", async (req, res) => {
     return;
   }
 
-  db.prepare("UPDATE albums SET cover_asset_id = NULL WHERE cover_asset_id = ?").run(asset.id);
-  db.prepare("DELETE FROM assets WHERE id = ?").run(asset.id);
-  await fs.rm(path.dirname(path.join(dataDir, asset.original_path)), { recursive: true, force: true });
+  await deleteAssetCompletely(asset);
   res.json({ ok: true });
 });
 
@@ -981,15 +986,40 @@ async function processConcurrent<T, R>(
   return results;
 }
 
-function cleanupExpiredSessions() {
+async function deleteAssetCompletely(asset: AssetRow) {
+  db.prepare("UPDATE albums SET cover_asset_id = NULL WHERE cover_asset_id = ?").run(asset.id);
+  db.prepare("DELETE FROM assets WHERE id = ?").run(asset.id);
+  await fs.rm(path.dirname(path.join(dataDir, asset.original_path)), { recursive: true, force: true });
+}
+
+async function purgeExpiredTrash() {
+  if (!(trashRetentionDays > 0)) return;
+  const cutoff = new Date(Date.now() - trashRetentionDays * 24 * 60 * 60 * 1000).toISOString();
+  const expired = db
+    .prepare("SELECT * FROM assets WHERE trashed = 1 AND trashed_at IS NOT NULL AND trashed_at < ?")
+    .all(cutoff) as AssetRow[];
+  for (const asset of expired) {
+    try {
+      await deleteAssetCompletely(asset);
+    } catch (error) {
+      console.error(`Failed to purge trashed asset ${asset.id}:`, error);
+    }
+  }
+  if (expired.length) {
+    console.log(`Purged ${expired.length} asset(s) from trash (older than ${trashRetentionDays} days).`);
+  }
+}
+
+function runMaintenance() {
   try {
     db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now());
   } catch (error) {
     console.error("Session cleanup failed:", error);
   }
+  void purgeExpiredTrash().catch((error) => console.error("Trash purge failed:", error));
 }
-cleanupExpiredSessions();
-setInterval(cleanupExpiredSessions, 60 * 60 * 1000).unref();
+runMaintenance();
+setInterval(runMaintenance, 60 * 60 * 1000).unref();
 
 function authUser(req: express.Request) {
   return (req as unknown as AuthedRequest).user;
@@ -1126,7 +1156,7 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
 
 function restoreIfTrashed(asset: AssetRow): AssetRow {
   if (!asset.trashed) return asset;
-  db.prepare("UPDATE assets SET trashed = 0 WHERE id = ?").run(asset.id);
+  db.prepare("UPDATE assets SET trashed = 0, trashed_at = NULL WHERE id = ?").run(asset.id);
   return db.prepare("SELECT * FROM assets WHERE id = ?").get(asset.id) as AssetRow;
 }
 

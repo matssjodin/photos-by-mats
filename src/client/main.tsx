@@ -439,6 +439,9 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
           </div>
         </header>
 
+        {view === "trash" && (
+          <p className="view-note">Photos in the trash are deleted permanently after 30 days.</p>
+        )}
         {view === "admin" ? (
           <AdminPanel currentUser={user} />
         ) : view === "albums" && !activeAlbum ? (

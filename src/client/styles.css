@@ -325,6 +325,16 @@ button:disabled {
   box-shadow: var(--shadow);
 }
 
+.view-note {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 14px;
+}
+
 /* ---------- Library ---------- */
 
 .library {
