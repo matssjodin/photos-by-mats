@@ -12,6 +12,14 @@ npm run dev
 Frontend: <http://localhost:5173>  
 API: <http://localhost:4000>
 
+```bash
+npm run typecheck   # Type checking for client and server
+npm test            # Smoke/integration tests (boots the real server against a temp DATA_DIR)
+npm run build       # Production build
+```
+
+CI runs typecheck, build, tests, and a production-dependency audit on every push and pull request (`.github/workflows/ci.yml`).
+
 On startup, the server ensures the account from `ADMIN_EMAIL` and `ADMIN_PASSWORD` exists, is enabled, has admin access, and has that password. In development (NODE_ENV != production), if no users exist and those variables are missing, it falls back to:
 
 - Email: `admin@example.com`
@@ -31,6 +39,7 @@ ADMIN_PASSWORD=<your first admin password>
 APP_ORIGIN=https://photos.example.com
 MAX_UPLOAD_FILES=500
 MAX_UPLOAD_FILE_SIZE_MB=120
+INGEST_CONCURRENCY=3
 ```
 
 Set `APP_ORIGIN` to the public URL your browser hits — the cross-origin (CSRF) guard uses it to accept your own requests.

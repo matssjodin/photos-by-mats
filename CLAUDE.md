@@ -28,9 +28,12 @@ npm start            # Runs the compiled server
 
 # Type checking (both client and server)
 npm run typecheck
+
+# Smoke/integration tests (boots the real server against a temp DATA_DIR)
+npm test
 ```
 
-There are no tests. Type checking is the only automated correctness check.
+`tests/smoke.test.ts` runs with Node's built-in test runner via `tsx` and covers auth, CSRF, uploads, sharing, and admin authorization. CI (`.github/workflows/ci.yml`) runs typecheck, build, test, and a production-dependency audit on every push and PR.
 
 ## Architecture
 
@@ -59,8 +62,10 @@ In production, the Express server serves `dist-client/` as static files and catc
 | `PORT` | `4000` | Server port |
 | `DATA_DIR` | `./data` | Root for SQLite DB and uploads |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | — | Upserts an admin on startup if both are set |
+| `APP_ORIGIN` | — | Public origin accepted by the CSRF guard (set to the URL the browser hits) |
 | `MAX_UPLOAD_FILES` | `500` | Max files per upload request |
 | `MAX_UPLOAD_FILE_SIZE_MB` | `120` | Max file size per upload |
+| `INGEST_CONCURRENCY` | `3` | Parallel sharp workers during upload ingest |
 
 If no users exist and `ADMIN_EMAIL`/`ADMIN_PASSWORD` are not set, a dev admin `admin@example.com` / `change-me-before-deploy` is created.
 
