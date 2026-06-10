@@ -1,5 +1,6 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createPortal } from "react-dom";
 import {
   Archive,
   Camera,
@@ -72,6 +73,10 @@ const navItems = [
 ] as const;
 
 const viewerInfoStorageKey = "sjodinPhotos.viewer.showInfo";
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_MOVE_TOLERANCE = 10;
+const SWIPE_NAVIGATE_THRESHOLD = 60;
+const SWIPE_CLOSE_THRESHOLD = 90;
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -103,6 +108,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [activeAlbum, setActiveAlbum] = useState<Album | null>(null);
   const [selected, setSelected] = useState<Asset | null>(null);
+  const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
@@ -115,10 +121,15 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   const fileInput = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    if (!message) return;
+    if (!message || busy) return;
     const id = setTimeout(() => setMessage(""), 3500);
     return () => clearTimeout(id);
-  }, [message]);
+  }, [message, busy]);
+
+  // The viewer's "Add to album" list needs albums before the Albums tab is visited.
+  useEffect(() => {
+    void loadAlbums();
+  }, []);
 
   function confirmAction(request: ConfirmRequest) {
     setConfirmState(request);
@@ -134,7 +145,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   }, [assets, search]);
 
   useEffect(() => {
-    setSelectedIds(new Set());
+    clearSelect();
     if (view === "admin") return;
     if (view === "albums") {
       loadAlbums();
@@ -292,6 +303,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   }
 
   function startSelect(id: string) {
+    setSelectMode(true);
     setSelectedIds(new Set([id]));
   }
 
@@ -299,11 +311,13 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id); else next.add(id);
+      if (next.size === 0) setSelectMode(false);
       return next;
     });
   }
 
   function clearSelect() {
+    setSelectMode(false);
     setSelectedIds(new Set());
   }
 
@@ -346,7 +360,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
               onClick={() => { setView(item.id); if (item.id === "albums") setActiveAlbum(null); }}
               type="button"
             >
-              <item.icon size={19} />
+              <item.icon size={20} />
               <span>{item.label}</span>
             </button>
           ))}
@@ -356,14 +370,10 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
               onClick={() => setView("admin")}
               type="button"
             >
-              <Shield size={19} />
+              <Shield size={20} />
               <span>Admin</span>
             </button>
           )}
-          <button className="nav-item mobile-only-nav" onClick={logout} type="button">
-            <LogOut size={19} />
-            <span>Log out</span>
-          </button>
         </nav>
         <div className="account-strip">
           <div>
@@ -378,11 +388,16 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
 
       <main className="main">
         <header className="topbar">
-          <div>
-            {showLibraryTools && (
-              <p className="eyebrow">{visibleAssets.length} item{visibleAssets.length === 1 ? "" : "s"}</p>
-            )}
-            <h1>{title}</h1>
+          <div className="topbar-heading">
+            <div>
+              {showLibraryTools && (
+                <p className="eyebrow">{visibleAssets.length} item{visibleAssets.length === 1 ? "" : "s"}</p>
+              )}
+              <h1>{title}</h1>
+            </div>
+            <button className="icon-button mobile-only" onClick={logout} title="Log out" type="button">
+              <LogOut size={20} />
+            </button>
           </div>
           <div className="toolbar">
             {showLibraryTools && (
@@ -397,6 +412,15 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
                   placeholder="Search"
                 />
               </label>
+            )}
+            {showLibraryTools && visibleAssets.length > 0 && (
+              <button
+                className="secondary-button"
+                onClick={() => selectMode ? clearSelect() : setSelectMode(true)}
+                type="button"
+              >
+                {selectMode ? "Done" : "Select"}
+              </button>
             )}
             {showLibraryTools && (
               <button className="primary-button" onClick={() => fileInput.current?.click()} type="button">
@@ -415,7 +439,6 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
           </div>
         </header>
 
-        {message && <div className="toast">{message}</div>}
         {view === "admin" ? (
           <AdminPanel currentUser={user} />
         ) : view === "albums" && !activeAlbum ? (
@@ -436,11 +459,14 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
               onToggleSelect={toggleSelect}
               onTrashSelected={trashSelected}
               onUpload={() => fileInput.current?.click()}
+              selectMode={selectMode}
               selectedIds={selectedIds}
             />
           </DropArea>
         )}
       </main>
+
+      {message && <Overlay><div className="toast">{message}</div></Overlay>}
 
       {addModalOpen && activeAlbum && (
         <AddExistingModal
@@ -477,6 +503,22 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   );
 }
 
+/** Renders overlay content at document.body so position:fixed always means the
+ *  real viewport — no ancestor (backdrop-filter, transform, …) can re-anchor it. */
+function Overlay({ children }: { children: React.ReactNode }) {
+  return createPortal(children, document.body);
+}
+
+function useBodyScrollLock() {
+  useEffect(() => {
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, []);
+}
+
 type ConfirmRequest = {
   title: string;
   body?: string;
@@ -490,6 +532,7 @@ type ConfirmRequest = {
 function ConfirmDialog({ request, onClose }: { request: ConfirmRequest; onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  useBodyScrollLock();
   async function handleConfirm() {
     setBusy(true);
     setError("");
@@ -508,45 +551,50 @@ function ConfirmDialog({ request, onClose }: { request: ConfirmRequest; onClose:
     onClose();
   }
   return (
-    <div className="modal-backdrop" onClick={handleCancel}>
-      <section className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
-        <div className="modal-head">
-          <h2>{request.title}</h2>
-        </div>
-        {request.body && <p>{request.body}</p>}
-        {error && <p className="form-error">{error}</p>}
-        <div className="modal-actions">
-          <button className="secondary-button" disabled={busy} onClick={handleCancel} type="button">{request.cancelLabel ?? "Cancel"}</button>
-          <button
-            className={request.danger ? "danger-button" : "primary-button"}
-            disabled={busy}
-            onClick={() => void handleConfirm()}
-            type="button"
-          >
-            {busy ? "Working" : (request.confirmLabel ?? "Confirm")}
-          </button>
-        </div>
-      </section>
-    </div>
+    <Overlay>
+      <div className="modal-backdrop" onClick={handleCancel}>
+        <section className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-head">
+            <h2>{request.title}</h2>
+          </div>
+          {request.body && <p>{request.body}</p>}
+          {error && <p className="form-error">{error}</p>}
+          <div className="modal-actions">
+            <button className="secondary-button" disabled={busy} onClick={handleCancel} type="button">{request.cancelLabel ?? "Cancel"}</button>
+            <button
+              className={request.danger ? "danger-button" : "primary-button"}
+              disabled={busy}
+              onClick={() => void handleConfirm()}
+              type="button"
+            >
+              {busy ? "Working" : (request.confirmLabel ?? "Confirm")}
+            </button>
+          </div>
+        </section>
+      </div>
+    </Overlay>
   );
 }
 
 function LinkPrompt({ url, onClose }: { url: string; onClose: () => void }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  useBodyScrollLock();
   useEffect(() => { inputRef.current?.select(); }, []);
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <section className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
-        <div className="modal-head">
-          <h2>Share link</h2>
-        </div>
-        <p>Couldn't copy automatically. Select and copy the link below.</p>
-        <input ref={inputRef} readOnly value={url} onFocus={(event) => event.target.select()} />
-        <div className="modal-actions">
-          <button className="primary-button" onClick={onClose} type="button">Done</button>
-        </div>
-      </section>
-    </div>
+    <Overlay>
+      <div className="modal-backdrop" onClick={onClose}>
+        <section className="modal confirm-modal" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-head">
+            <h2>Share link</h2>
+          </div>
+          <p>Couldn't copy automatically. Select and copy the link below.</p>
+          <input ref={inputRef} readOnly value={url} onFocus={(event) => event.target.select()} />
+          <div className="modal-actions">
+            <button className="primary-button" onClick={onClose} type="button">Done</button>
+          </div>
+        </section>
+      </div>
+    </Overlay>
   );
 }
 
@@ -663,6 +711,148 @@ function SharedAlbum({ token }: { token: string }) {
   );
 }
 
+/**
+ * The image stage shared by both viewers. Owns keyboard navigation, touch
+ * gestures (swipe left/right to navigate, swipe down to close), neighbour
+ * preloading, and the top toolbar. Rendered in a portal so `fixed` always
+ * anchors to the viewport.
+ */
+function ViewerStage({
+  asset,
+  previous,
+  next,
+  onClose,
+  onSelect,
+  actions,
+  panel,
+  infoOpen
+}: {
+  asset: Asset;
+  previous: Asset | null;
+  next: Asset | null;
+  onClose: () => void;
+  onSelect: (asset: Asset) => void;
+  actions?: React.ReactNode;
+  panel?: React.ReactNode;
+  infoOpen?: boolean;
+}) {
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const gesture = useRef<{ x: number; y: number; dx: number; dy: number } | null>(null);
+  const justSwiped = useRef(false);
+  useBodyScrollLock();
+
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft" && previous) onSelect(previous);
+      if (event.key === "ArrowRight" && next) onSelect(next);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [next, previous, onClose, onSelect]);
+
+  useEffect(() => {
+    for (const neighbour of [previous, next]) {
+      if (neighbour) {
+        const preload = new Image();
+        preload.src = neighbour.urls.preview;
+      }
+    }
+  }, [previous?.id, next?.id]);
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.pointerType === "mouse") return;
+    // Pointer capture would redirect the eventual click away from toolbar
+    // buttons, so gestures rely on bubbling instead — and never start on one.
+    if ((event.target as HTMLElement).closest("button")) return;
+    gesture.current = { x: event.clientX, y: event.clientY, dx: 0, dy: 0 };
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const current = gesture.current;
+    const img = imgRef.current;
+    if (!current || !img) return;
+    current.dx = event.clientX - current.x;
+    current.dy = event.clientY - current.y;
+    img.style.transition = "none";
+    if (Math.abs(current.dx) >= Math.abs(current.dy)) {
+      img.style.transform = `translateX(${current.dx}px)`;
+    } else if (current.dy > 0) {
+      const scale = Math.max(0.8, 1 - current.dy / 1200);
+      img.style.transform = `translateY(${current.dy}px) scale(${scale})`;
+    }
+  }
+
+  function handlePointerEnd() {
+    const current = gesture.current;
+    gesture.current = null;
+    const img = imgRef.current;
+    if (!current || !img) return;
+    justSwiped.current = Math.hypot(current.dx, current.dy) > 10;
+    const horizontal = Math.abs(current.dx) >= Math.abs(current.dy);
+    if (horizontal && current.dx <= -SWIPE_NAVIGATE_THRESHOLD && next) {
+      onSelect(next);
+      return;
+    }
+    if (horizontal && current.dx >= SWIPE_NAVIGATE_THRESHOLD && previous) {
+      onSelect(previous);
+      return;
+    }
+    if (!horizontal && current.dy >= SWIPE_CLOSE_THRESHOLD) {
+      onClose();
+      return;
+    }
+    img.style.transition = "transform 180ms ease";
+    img.style.transform = "";
+  }
+
+  return (
+    <Overlay>
+      <div aria-modal="true" className={infoOpen ? "viewer info-open" : "viewer"} role="dialog">
+        <div
+          className="viewer-stage"
+          onClick={(event) => {
+            if (justSwiped.current) {
+              justSwiped.current = false;
+              return;
+            }
+            if (event.target === event.currentTarget) onClose();
+          }}
+          onPointerCancel={handlePointerEnd}
+          onPointerDown={handlePointerDown}
+          onPointerLeave={handlePointerEnd}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerEnd}
+        >
+          <div className="viewer-topbar">
+            <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
+            <div className="viewer-actions">{actions}</div>
+          </div>
+          {previous && (
+            <button className="viewer-nav previous" onClick={() => onSelect(previous)} title="Previous" type="button">
+              <ChevronLeft size={28} />
+            </button>
+          )}
+          <img
+            alt={asset.originalName}
+            className="viewer-image"
+            draggable={false}
+            key={asset.id}
+            ref={imgRef}
+            src={asset.urls.preview}
+          />
+          {next && (
+            <button className="viewer-nav next" onClick={() => onSelect(next)} title="Next" type="button">
+              <ChevronRight size={28} />
+            </button>
+          )}
+        </div>
+        {panel}
+      </div>
+    </Overlay>
+  );
+}
+
 function SharedViewer({
   asset,
   assets,
@@ -677,26 +867,99 @@ function SharedViewer({
   const index = assets.findIndex((item) => item.id === asset.id);
   const previous = index > 0 ? assets[index - 1] : null;
   const next = index >= 0 && index < assets.length - 1 ? assets[index + 1] : null;
+  return <ViewerStage asset={asset} next={next} onClose={onClose} onSelect={onSelect} previous={previous} />;
+}
 
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
-      if (event.key === "ArrowLeft" && previous) onSelect(previous);
-      if (event.key === "ArrowRight" && next) onSelect(next);
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [next, previous, onClose, onSelect]);
+function Viewer({
+  activeAlbum,
+  albums,
+  asset,
+  assets,
+  onAddToAlbum,
+  onClose,
+  onDelete,
+  onMutate,
+  onSelect,
+  onSetCover
+}: {
+  activeAlbum: Album | null;
+  albums: Album[];
+  asset: Asset;
+  assets: Asset[];
+  onAddToAlbum: (albumId: string, assetId: string) => Promise<void>;
+  onClose: () => void;
+  onDelete: (asset: Asset) => Promise<void>;
+  onMutate: (asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) => Promise<void>;
+  onSelect: (asset: Asset) => void;
+  onSetCover: (albumId: string, assetId: string) => Promise<void>;
+}) {
+  const [showInfo, setShowInfo] = useState(() => localStorage.getItem(viewerInfoStorageKey) === "true");
+  const index = assets.findIndex((item) => item.id === asset.id);
+  const previous = index > 0 ? assets[index - 1] : null;
+  const next = index >= 0 && index < assets.length - 1 ? assets[index + 1] : null;
+
+  function toggleInfo() {
+    setShowInfo((current) => {
+      const nextValue = !current;
+      localStorage.setItem(viewerInfoStorageKey, String(nextValue));
+      return nextValue;
+    });
+  }
+
+  const actions = (
+    <>
+      <button className={asset.favorite ? "icon-button light active" : "icon-button light"} onClick={() => void onMutate(asset, { favorite: !asset.favorite })} title="Favorite" type="button"><Heart size={20} /></button>
+      <button className="icon-button light" onClick={() => void onMutate(asset, { archived: !asset.archived })} title="Archive" type="button"><Archive size={20} /></button>
+      <button className="icon-button light" onClick={() => void onMutate(asset, { trashed: !asset.trashed })} title="Trash" type="button"><Trash2 size={20} /></button>
+      <button className={showInfo ? "icon-button light active" : "icon-button light"} onClick={toggleInfo} title={showInfo ? "Hide info" : "Show info"} type="button"><Info size={20} /></button>
+    </>
+  );
+
+  const panel = showInfo ? (
+    <aside className="info-panel">
+      <div className="info-grip" />
+      <h2>{asset.originalName}</h2>
+      <dl>
+        <div><dt>Date</dt><dd>{prettyDate(asset.takenAt)}</dd></div>
+        <div><dt>Size</dt><dd>{formatBytes(asset.sizeBytes)}</dd></div>
+        <div><dt>Dimensions</dt><dd>{asset.width && asset.height ? `${asset.width} x ${asset.height}` : "Unknown"}</dd></div>
+        <div><dt>Type</dt><dd>{asset.mimeType}</dd></div>
+      </dl>
+      <div className="info-actions">
+        {asset.urls.original && (
+          <a className="secondary-button" href={asset.urls.original} target="_blank" rel="noreferrer">Original</a>
+        )}
+        {activeAlbum && (
+          <button className="secondary-button" onClick={() => void onSetCover(activeAlbum.id, asset.id)} type="button">Set as cover</button>
+        )}
+        {asset.trashed ? (
+          <button className="danger-button" onClick={() => void onDelete(asset)} type="button">Delete permanently</button>
+        ) : (
+          <button className="secondary-button" onClick={() => void onMutate(asset, { trashed: true })} type="button">Move to trash</button>
+        )}
+      </div>
+      {!!albums.length && (
+        <div className="album-pick">
+          <span>Add to album</span>
+          {albums.map((album) => (
+            <button key={album.id} onClick={() => void onAddToAlbum(album.id, asset.id)} type="button">{album.title}</button>
+          ))}
+        </div>
+      )}
+    </aside>
+  ) : undefined;
 
   return (
-    <div className="viewer">
-      <div className="viewer-toolbar">
-        <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
-      </div>
-      {previous && <button className="viewer-nav previous" onClick={() => onSelect(previous)} type="button"><ChevronLeft size={28} /></button>}
-      <img className="viewer-image public" src={asset.urls.preview} alt={asset.originalName} />
-      {next && <button className="viewer-nav next public" onClick={() => onSelect(next)} type="button"><ChevronRight size={28} /></button>}
-    </div>
+    <ViewerStage
+      actions={actions}
+      asset={asset}
+      infoOpen={showInfo}
+      next={next}
+      onClose={onClose}
+      onSelect={onSelect}
+      panel={panel}
+      previous={previous}
+    />
   );
 }
 
@@ -714,6 +977,7 @@ function LibraryView({
   onToggleSelect = () => {},
   onTrashSelected = async () => {},
   onUpload,
+  selectMode = false,
   selectedIds = new Set<string>(),
 }: {
   activeAlbum: Album | null;
@@ -729,36 +993,39 @@ function LibraryView({
   onToggleSelect?: (id: string) => void;
   onTrashSelected?: () => Promise<void>;
   onUpload: () => void;
+  selectMode?: boolean;
   selectedIds?: Set<string>;
 }) {
-  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
   const longPressFired = useRef(false);
-  const isPressing = useRef(false);
 
-  function handlePointerDown(assetId: string) {
-    if (selectedIds.size > 0) return;
-    isPressing.current = true;
-    longPressFired.current = false;
-    longPressTimer.current = setTimeout(() => {
-      longPressFired.current = true;
-      isPressing.current = false;
-      onStartSelect(assetId);
-    }, 3000);
-  }
-
-  function handlePointerUp() {
-    isPressing.current = false;
-    if (longPressTimer.current) {
-      clearTimeout(longPressTimer.current);
-      longPressTimer.current = null;
+  function cancelPress() {
+    if (press.current) {
+      clearTimeout(press.current.timer);
+      press.current = null;
     }
   }
 
-  function handlePointerMove() {
-    if (isPressing.current) {
-      isPressing.current = false;
-      clearTimeout(longPressTimer.current!);
-      longPressTimer.current = null;
+  function handlePointerDown(event: React.PointerEvent, assetId: string) {
+    if (selectMode) return;
+    longPressFired.current = false;
+    cancelPress();
+    press.current = {
+      x: event.clientX,
+      y: event.clientY,
+      timer: setTimeout(() => {
+        longPressFired.current = true;
+        press.current = null;
+        onStartSelect(assetId);
+      }, LONG_PRESS_MS)
+    };
+  }
+
+  function handlePointerMove(event: React.PointerEvent) {
+    const start = press.current;
+    if (!start) return;
+    if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > LONG_PRESS_MOVE_TOLERANCE) {
+      cancelPress();
     }
   }
 
@@ -767,7 +1034,7 @@ function LibraryView({
       longPressFired.current = false;
       return;
     }
-    if (selectedIds.size > 0) {
+    if (selectMode) {
       onToggleSelect(asset.id);
     } else {
       onSelect(asset);
@@ -804,21 +1071,20 @@ function LibraryView({
             <div className="photo-grid">
               {group.assets.map((asset) => {
                 const isSelected = selectedIds.has(asset.id);
-                const inSelectMode = selectedIds.size > 0;
                 return (
                   <button
-                    className={`photo-tile${inSelectMode ? " selectable" : ""}${isSelected ? " is-selected" : ""}`}
+                    className={`photo-tile${selectMode ? " selectable" : ""}${isSelected ? " is-selected" : ""}`}
                     key={asset.id}
                     onClick={() => handleTileClick(asset)}
-                    onPointerDown={() => handlePointerDown(asset.id)}
-                    onPointerUp={handlePointerUp}
+                    onPointerDown={(event) => handlePointerDown(event, asset.id)}
+                    onPointerUp={cancelPress}
                     onPointerMove={handlePointerMove}
-                    onPointerCancel={handlePointerUp}
+                    onPointerCancel={cancelPress}
                     onContextMenu={(e) => e.preventDefault()}
                     type="button"
                   >
                     <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" draggable={false} />
-                    {inSelectMode
+                    {selectMode
                       ? <span className={`tile-checkbox${isSelected ? " checked" : ""}`} />
                       : <>
                           {asset.favorite && <span className="tile-badge"><Heart size={14} fill="currentColor" /></span>}
@@ -827,6 +1093,14 @@ function LibraryView({
                               className="tile-cover-btn"
                               onClick={(e) => { e.stopPropagation(); void onSetCover(activeAlbum.id, asset.id); }}
                               role="button"
+                              tabIndex={0}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  void onSetCover(activeAlbum.id, asset.id);
+                                }
+                              }}
                               title="Set as album cover"
                             ><Star size={12} /></span>
                           )}
@@ -839,16 +1113,18 @@ function LibraryView({
           </div>
         ))}
       </section>
-      {selectedIds.size > 0 && (
-        <div className="select-bar">
-          <span>{selectedIds.size} photo{selectedIds.size === 1 ? "" : "s"} selected</span>
-          <div className="select-bar-actions">
-            <button className="secondary-button" onClick={onClearSelect} type="button">Cancel</button>
-            <button className="danger-button" onClick={() => void onTrashSelected()} type="button">
-              <Trash2 size={18} /><span>Trash</span>
-            </button>
+      {selectMode && (
+        <Overlay>
+          <div className="select-bar">
+            <span>{selectedIds.size} photo{selectedIds.size === 1 ? "" : "s"} selected</span>
+            <div className="select-bar-actions">
+              <button className="secondary-button" onClick={onClearSelect} type="button">Cancel</button>
+              <button className="danger-button" disabled={selectedIds.size === 0} onClick={() => void onTrashSelected()} type="button">
+                <Trash2 size={18} /><span>Trash</span>
+              </button>
+            </div>
           </div>
-        </div>
+        </Overlay>
       )}
     </>
   );
@@ -999,6 +1275,7 @@ function AddExistingModal({
   const existingIds = useMemo(() => new Set(albumAssets.map((asset) => asset.id)), [albumAssets]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const candidates = assets.filter((asset) => !existingIds.has(asset.id));
+  useBodyScrollLock();
 
   async function submit() {
     if (!selectedIds.length) return;
@@ -1007,139 +1284,45 @@ function AddExistingModal({
   }
 
   return (
-    <div className="modal-backdrop">
-      <section className="modal">
-        <div className="modal-head">
-          <div>
-            <p className="eyebrow">{candidates.length} available</p>
-            <h2>Add to {album.title}</h2>
-          </div>
-          <button className="icon-button" onClick={onClose} title="Close" type="button"><X size={18} /></button>
-        </div>
-        {candidates.length ? (
-          <div className="picker-grid">
-            {candidates.map((asset) => {
-              const checked = selectedIds.includes(asset.id);
-              return (
-                <button
-                  className={checked ? "picker-tile selected" : "picker-tile"}
-                  key={asset.id}
-                  onClick={() => setSelectedIds((current) => checked ? current.filter((id) => id !== asset.id) : [...current, asset.id])}
-                  type="button"
-                >
-                  <img src={asset.urls.thumb} alt={asset.originalName} />
-                  <span>{checked ? "Selected" : asset.originalName}</span>
-                </button>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="empty-inline">Every available photo is already in this album.</div>
-        )}
-        <div className="modal-actions">
-          <button className="secondary-button" onClick={onClose} type="button">Cancel</button>
-          <button className="primary-button" disabled={!selectedIds.length} onClick={() => void submit()} type="button">
-            Add {selectedIds.length || ""}
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function Viewer({
-  activeAlbum,
-  albums,
-  asset,
-  assets,
-  onAddToAlbum,
-  onClose,
-  onDelete,
-  onMutate,
-  onSelect,
-  onSetCover
-}: {
-  activeAlbum: Album | null;
-  albums: Album[];
-  asset: Asset;
-  assets: Asset[];
-  onAddToAlbum: (albumId: string, assetId: string) => Promise<void>;
-  onClose: () => void;
-  onDelete: (asset: Asset) => Promise<void>;
-  onMutate: (asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) => Promise<void>;
-  onSelect: (asset: Asset) => void;
-  onSetCover: (albumId: string, assetId: string) => Promise<void>;
-}) {
-  const [showInfo, setShowInfo] = useState(() => localStorage.getItem(viewerInfoStorageKey) === "true");
-  const index = assets.findIndex((item) => item.id === asset.id);
-  const previous = index > 0 ? assets[index - 1] : null;
-  const next = index >= 0 && index < assets.length - 1 ? assets[index + 1] : null;
-
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
-      if (event.key === "ArrowLeft" && previous) onSelect(previous);
-      if (event.key === "ArrowRight" && next) onSelect(next);
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [next, previous, onClose, onSelect]);
-
-  function toggleInfo() {
-    setShowInfo((current) => {
-      const nextValue = !current;
-      localStorage.setItem(viewerInfoStorageKey, String(nextValue));
-      return nextValue;
-    });
-  }
-
-  return (
-    <div className={showInfo ? "viewer info-open" : "viewer info-closed"}>
-      <div className="viewer-toolbar">
-        <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
-        <div className="viewer-actions">
-          <button className={asset.favorite ? "icon-button light active" : "icon-button light"} onClick={() => void onMutate(asset, { favorite: !asset.favorite })} title="Favorite" type="button"><Heart size={20} /></button>
-          <button className="icon-button light" onClick={() => void onMutate(asset, { archived: !asset.archived })} title="Archive" type="button"><Archive size={20} /></button>
-          <button className="icon-button light" onClick={() => void onMutate(asset, { trashed: !asset.trashed })} title="Trash" type="button"><Trash2 size={20} /></button>
-          <button className={showInfo ? "icon-button light active" : "icon-button light"} onClick={toggleInfo} title={showInfo ? "Hide info" : "Show info"} type="button"><Info size={20} /></button>
-        </div>
-      </div>
-      {previous && <button className="viewer-nav previous" onClick={() => onSelect(previous)} type="button"><ChevronLeft size={28} /></button>}
-      <img className="viewer-image" src={asset.urls.preview} alt={asset.originalName} />
-      {next && <button className="viewer-nav next" onClick={() => onSelect(next)} type="button"><ChevronRight size={28} /></button>}
-      {showInfo && (
-        <aside className="info-panel">
-          <h2>{asset.originalName}</h2>
-          <dl>
-            <div><dt>Date</dt><dd>{prettyDate(asset.takenAt)}</dd></div>
-            <div><dt>Size</dt><dd>{formatBytes(asset.sizeBytes)}</dd></div>
-            <div><dt>Dimensions</dt><dd>{asset.width && asset.height ? `${asset.width} x ${asset.height}` : "Unknown"}</dd></div>
-            <div><dt>Type</dt><dd>{asset.mimeType}</dd></div>
-          </dl>
-          <div className="info-actions">
-            {asset.urls.original && (
-              <a className="secondary-button" href={asset.urls.original} target="_blank" rel="noreferrer">Original</a>
-            )}
-            {activeAlbum && (
-              <button className="secondary-button" onClick={() => void onSetCover(activeAlbum.id, asset.id)} type="button">Set as cover</button>
-            )}
-            {asset.trashed ? (
-              <button className="danger-button" onClick={() => void onDelete(asset)} type="button">Delete permanently</button>
-            ) : (
-              <button className="secondary-button" onClick={() => void onMutate(asset, { trashed: true })} type="button">Move to trash</button>
-            )}
-          </div>
-          {!!albums.length && (
-            <div className="album-pick">
-              <span>Add to album</span>
-              {albums.map((album) => (
-                <button key={album.id} onClick={() => void onAddToAlbum(album.id, asset.id)} type="button">{album.title}</button>
-              ))}
+    <Overlay>
+      <div className="modal-backdrop" onClick={onClose}>
+        <section className="modal" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-head">
+            <div>
+              <p className="eyebrow">{candidates.length} available</p>
+              <h2>Add to {album.title}</h2>
             </div>
+            <button className="icon-button" onClick={onClose} title="Close" type="button"><X size={18} /></button>
+          </div>
+          {candidates.length ? (
+            <div className="picker-grid">
+              {candidates.map((asset) => {
+                const checked = selectedIds.includes(asset.id);
+                return (
+                  <button
+                    className={checked ? "picker-tile selected" : "picker-tile"}
+                    key={asset.id}
+                    onClick={() => setSelectedIds((current) => checked ? current.filter((id) => id !== asset.id) : [...current, asset.id])}
+                    type="button"
+                  >
+                    <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" />
+                    <span>{checked ? "Selected" : asset.originalName}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="empty-inline">Every available photo is already in this album.</div>
           )}
-        </aside>
-      )}
-    </div>
+          <div className="modal-actions">
+            <button className="secondary-button" onClick={onClose} type="button">Cancel</button>
+            <button className="primary-button" disabled={!selectedIds.length} onClick={() => void submit()} type="button">
+              Add {selectedIds.length || ""}
+            </button>
+          </div>
+        </section>
+      </div>
+    </Overlay>
   );
 }
 
