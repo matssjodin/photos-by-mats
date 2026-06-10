@@ -57,9 +57,9 @@ function authedHeaders(extra: Record<string, string> = {}) {
   return { Cookie: sessionCookie, Origin: origin, ...extra };
 }
 
-async function makePng() {
+async function makePng(background = { r: 200, g: 100, b: 50 }) {
   return sharp({
-    create: { width: 64, height: 48, channels: 3, background: { r: 200, g: 100, b: 50 } }
+    create: { width: 64, height: 48, channels: 3, background }
   }).png().toBuffer();
 }
 
@@ -240,4 +240,45 @@ test("admin can create a user; new user cannot access admin routes", async () =>
     headers: { Cookie: userCookie, Origin: origin }
   });
   assert.equal(adminAttempt.status, 403);
+});
+
+test("re-uploading an identical image is reported as a duplicate, not stored twice", async () => {
+  const png = await makePng({ r: 10, g: 120, b: 200 });
+  const upload = async () => {
+    const form = new FormData();
+    form.append("photos", new Blob([new Uint8Array(png)], { type: "image/png" }), "dup.png");
+    const response = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+    assert.equal(response.status, 201);
+    return response.json() as Promise<{ assets: Array<{ id: string }>; duplicates: Array<{ id: string }> }>;
+  };
+
+  const first = await upload();
+  assert.equal(first.assets.length, 1);
+  assert.equal(first.duplicates.length, 0);
+
+  const second = await upload();
+  assert.equal(second.assets.length, 0);
+  assert.equal(second.duplicates.length, 1);
+  assert.equal(second.duplicates[0].id, first.assets[0].id);
+});
+
+test("re-uploading a trashed duplicate restores it", async () => {
+  const png = await makePng({ r: 10, g: 120, b: 200 });
+  const listBefore = await fetch(`${baseUrl}/api/assets?view=photos`, { headers: authedHeaders() });
+  const { assets: before } = await listBefore.json() as { assets: Array<{ id: string }> };
+  const target = before[0];
+
+  await fetch(`${baseUrl}/api/assets/${target.id}`, {
+    method: "PATCH",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ trashed: true })
+  });
+
+  const form = new FormData();
+  form.append("photos", new Blob([new Uint8Array(png)], { type: "image/png" }), "dup.png");
+  const response = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+  const body = await response.json() as { duplicates: Array<{ id: string; trashed: boolean }> };
+  assert.equal(body.duplicates.length, 1);
+  assert.equal(body.duplicates[0].id, target.id);
+  assert.equal(body.duplicates[0].trashed, false);
 });

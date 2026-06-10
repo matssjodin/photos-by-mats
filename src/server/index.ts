@@ -3,6 +3,7 @@ import express from "express";
 import multer from "multer";
 import { DatabaseSync } from "node:sqlite";
 import crypto from "node:crypto";
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
@@ -62,6 +63,7 @@ type AssetRow = {
   original_path: string;
   preview_path: string;
   thumb_path: string;
+  content_hash: string | null;
 };
 
 type AlbumRow = {
@@ -170,6 +172,8 @@ db.exec(`
 ensureColumn("albums", "share_token", "TEXT");
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_share_token ON albums(share_token) WHERE share_token IS NOT NULL");
 ensureColumn("albums", "cover_asset_id", "TEXT");
+ensureColumn("assets", "content_hash", "TEXT");
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_user_hash ON assets(user_id, content_hash) WHERE content_hash IS NOT NULL");
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_assets_user ON assets(user_id, trashed, archived);
   CREATE INDEX IF NOT EXISTS idx_albums_user ON albums(user_id);
@@ -439,17 +443,19 @@ app.post("/api/assets", upload.array("photos", maxUploadFiles), async (req, res,
 
     const outcomes = await processConcurrent(files, ingestConcurrency, (file) => ingestAsset(user.id, file));
     const created: ReturnType<typeof toPublicAsset>[] = [];
+    const duplicates: ReturnType<typeof toPublicAsset>[] = [];
     const errors: Array<{ name: string; error: string }> = [];
     outcomes.forEach((outcome, index) => {
-      if (outcome.ok) created.push(outcome.value);
-      else errors.push({ name: files[index].originalname, error: outcome.error.message });
+      if (!outcome.ok) errors.push({ name: files[index].originalname, error: outcome.error.message });
+      else if (outcome.value.duplicate) duplicates.push(outcome.value.asset);
+      else created.push(outcome.value.asset);
     });
 
-    if (!created.length) {
+    if (!created.length && !duplicates.length) {
       res.status(500).json({ error: "Upload failed.", errors });
       return;
     }
-    res.status(201).json({ assets: created, errors });
+    res.status(201).json({ assets: created, duplicates, errors });
   } catch (error) {
     next(error);
   }
@@ -607,6 +613,7 @@ app.post("/api/albums/:id/upload", upload.array("photos", maxUploadFiles), async
 
     const outcomes = await processConcurrent(files, ingestConcurrency, (file) => ingestAsset(user.id, file));
     const created: ReturnType<typeof toPublicAsset>[] = [];
+    const duplicates: ReturnType<typeof toPublicAsset>[] = [];
     const errors: Array<{ name: string; error: string }> = [];
     const insertAlbumAsset = db.prepare("INSERT OR IGNORE INTO album_assets (album_id, asset_id, added_at) VALUES (?, ?, ?)");
     outcomes.forEach((outcome, index) => {
@@ -615,19 +622,23 @@ app.post("/api/albums/:id/upload", upload.array("photos", maxUploadFiles), async
         return;
       }
       try {
-        insertAlbumAsset.run(albumId, outcome.value.id, new Date().toISOString());
-        created.push(outcome.value);
+        // Duplicates still get linked: re-sharing an existing photo into an album is the intent.
+        insertAlbumAsset.run(albumId, outcome.value.asset.id, new Date().toISOString());
+        if (outcome.value.duplicate) duplicates.push(outcome.value.asset);
+        else created.push(outcome.value.asset);
       } catch (error) {
-        db.prepare("DELETE FROM assets WHERE id = ?").run(outcome.value.id);
+        if (!outcome.value.duplicate) {
+          db.prepare("DELETE FROM assets WHERE id = ?").run(outcome.value.asset.id);
+        }
         errors.push({ name: files[index].originalname, error: (error as Error).message });
       }
     });
 
-    if (!created.length) {
+    if (!created.length && !duplicates.length) {
       res.status(500).json({ error: "Upload failed.", errors });
       return;
     }
-    res.status(201).json({ assets: created, errors });
+    res.status(201).json({ assets: created, duplicates, errors });
   } catch (error) {
     next(error);
   }
@@ -762,6 +773,7 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
 
 const server = app.listen(port, () => {
   console.log(`Sjodin Photos is running on port ${port}`);
+  void backfillContentHashes().catch((error) => console.error("Hash backfill failed:", error));
 });
 
 function shutdown(signal: NodeJS.Signals) {
@@ -1018,7 +1030,7 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
   next();
 }
 
-async function ingestAsset(userId: string, file: Express.Multer.File) {
+async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{ asset: ReturnType<typeof toPublicAsset>; duplicate: boolean }> {
   const id = crypto.randomUUID();
   const ext = extensionFor(file.originalname, file.mimetype);
   const relativeDir = path.join("uploads", userId, id);
@@ -1035,6 +1047,15 @@ async function ingestAsset(userId: string, file: Express.Multer.File) {
     absoluteOriginal = path.join(dataDir, originalPath);
     await fs.rename(file.path, absoluteOriginal);
     movedOriginal = true;
+
+    const contentHash = await sha256File(absoluteOriginal);
+    const existing = db
+      .prepare("SELECT * FROM assets WHERE user_id = ? AND content_hash = ?")
+      .get(userId, contentHash) as AssetRow | undefined;
+    if (existing) {
+      await fs.rm(absoluteDir, { recursive: true, force: true }).catch(() => undefined);
+      return { asset: toPublicAsset(restoreIfTrashed(existing)), duplicate: true };
+    }
 
     const metadata = await sharp(absoluteOriginal).rotate().metadata();
     await sharp(absoluteOriginal)
@@ -1060,28 +1081,40 @@ async function ingestAsset(userId: string, file: Express.Multer.File) {
       // no EXIF date available
     }
 
-    db.prepare(`
-      INSERT INTO assets (
-        id, user_id, original_name, mime_type, size_bytes, width, height,
-        taken_at, created_at, original_path, preview_path, thumb_path
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      userId,
-      file.originalname,
-      file.mimetype,
-      file.size,
-      metadata.width ?? null,
-      metadata.height ?? null,
-      takenAt,
-      now,
-      originalPath,
-      previewPath,
-      thumbPath
-    );
+    try {
+      db.prepare(`
+        INSERT INTO assets (
+          id, user_id, original_name, mime_type, size_bytes, width, height,
+          taken_at, created_at, original_path, preview_path, thumb_path, content_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        userId,
+        file.originalname,
+        file.mimetype,
+        file.size,
+        metadata.width ?? null,
+        metadata.height ?? null,
+        takenAt,
+        now,
+        originalPath,
+        previewPath,
+        thumbPath,
+        contentHash
+      );
+    } catch (error) {
+      // Unique (user_id, content_hash) race: an identical file in the same
+      // batch finished first. Treat this copy as the duplicate.
+      const winner = db
+        .prepare("SELECT * FROM assets WHERE user_id = ? AND content_hash = ?")
+        .get(userId, contentHash) as AssetRow | undefined;
+      if (!winner) throw error;
+      await fs.rm(absoluteDir, { recursive: true, force: true }).catch(() => undefined);
+      return { asset: toPublicAsset(restoreIfTrashed(winner)), duplicate: true };
+    }
 
     const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow;
-    return toPublicAsset(row);
+    return { asset: toPublicAsset(row), duplicate: false };
   } catch (error) {
     await fs.rm(absoluteDir, { recursive: true, force: true }).catch(() => undefined);
     if (!movedOriginal) {
@@ -1089,6 +1122,40 @@ async function ingestAsset(userId: string, file: Express.Multer.File) {
     }
     throw error;
   }
+}
+
+function restoreIfTrashed(asset: AssetRow): AssetRow {
+  if (!asset.trashed) return asset;
+  db.prepare("UPDATE assets SET trashed = 0 WHERE id = ?").run(asset.id);
+  return db.prepare("SELECT * FROM assets WHERE id = ?").get(asset.id) as AssetRow;
+}
+
+function sha256File(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    createReadStream(filePath)
+      .on("data", (chunk) => hash.update(chunk))
+      .on("end", () => resolve(hash.digest("hex")))
+      .on("error", reject);
+  });
+}
+
+/** One-time backfill of content hashes for assets ingested before dedupe existed. */
+async function backfillContentHashes() {
+  const rows = db.prepare("SELECT id, user_id, original_path FROM assets WHERE content_hash IS NULL").all() as
+    Array<{ id: string; user_id: string; original_path: string }>;
+  if (!rows.length) return;
+  let updated = 0;
+  for (const row of rows) {
+    try {
+      const hash = await sha256File(path.join(dataDir, row.original_path));
+      db.prepare("UPDATE assets SET content_hash = ? WHERE id = ?").run(hash, row.id);
+      updated += 1;
+    } catch {
+      // Pre-existing duplicate or unreadable file — leave NULL so it never blocks anything.
+    }
+  }
+  console.log(`Backfilled content hashes for ${updated}/${rows.length} assets.`);
 }
 
 function extensionFor(filename: string, mimeType: string) {
