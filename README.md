@@ -1,6 +1,8 @@
 # Sjodin Photos
 
-A private, self-hosted Google Photos-style app. It has server-side accounts, admin-only user creation, local disk photo storage, generated browsing previews, albums, favorites, archive, trash, drag-and-drop uploads, random share links for albums, and a responsive modern UI.
+A private, self-hosted Google Photos-style app. It has server-side accounts, admin-only user creation, local disk photo storage, generated browsing previews, albums, favorites, archive, trash (auto-purged after 30 days), drag-and-drop uploads with progress and duplicate detection, bulk actions (album, favorite, archive, zip download), a touch-first viewer with swipe navigation and pinch zoom, random share links for albums, and a responsive mobile-first UI.
+
+It is installable as a PWA: on Android/Chrome use "Add to Home Screen" to get a standalone app that also appears in the system share sheet — sharing photos to it uploads them straight into the library. On iOS, Add to Home Screen gives a full-screen app.
 
 ## Local Development
 
@@ -40,6 +42,7 @@ APP_ORIGIN=https://photos.example.com
 MAX_UPLOAD_FILES=500
 MAX_UPLOAD_FILE_SIZE_MB=120
 INGEST_CONCURRENCY=3
+TRASH_RETENTION_DAYS=30
 ```
 
 Set `APP_ORIGIN` to the public URL your browser hits — the cross-origin (CSRF) guard uses it to accept your own requests.
