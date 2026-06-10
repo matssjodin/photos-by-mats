@@ -105,6 +105,11 @@ const upload = multer({
 await fs.mkdir(uploadsDir, { recursive: true });
 await fs.mkdir(tempDir, { recursive: true });
 
+// Multer stages uploads in tempDir; anything left there is from a crashed upload.
+for (const entry of await fs.readdir(tempDir)) {
+  await fs.rm(path.join(tempDir, entry), { recursive: true, force: true }).catch(() => undefined);
+}
+
 const db = new DatabaseSync(dbPath);
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -165,6 +170,13 @@ db.exec(`
 ensureColumn("albums", "share_token", "TEXT");
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_share_token ON albums(share_token) WHERE share_token IS NOT NULL");
 ensureColumn("albums", "cover_asset_id", "TEXT");
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_assets_user ON assets(user_id, trashed, archived);
+  CREATE INDEX IF NOT EXISTS idx_albums_user ON albums(user_id);
+  CREATE INDEX IF NOT EXISTS idx_album_assets_asset ON album_assets(asset_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+`);
 ensureAdminAccount();
 
 app.use(securityHeaders);
@@ -748,9 +760,25 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
   res.status(500).json({ error: "Something went wrong." });
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`Sjodin Photos is running on port ${port}`);
 });
+
+function shutdown(signal: NodeJS.Signals) {
+  console.log(`Received ${signal}, shutting down.`);
+  server.close(() => {
+    try {
+      db.close();
+    } catch (error) {
+      console.error("Failed to close database cleanly:", error);
+    }
+    process.exit(0);
+  });
+  // In-flight uploads get 10 seconds to finish before a hard exit.
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 function getAlbumById(albumId: string): AlbumRow {
   return db.prepare(`
@@ -949,7 +977,7 @@ function cleanupExpiredSessions() {
   }
 }
 cleanupExpiredSessions();
-setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
+setInterval(cleanupExpiredSessions, 60 * 60 * 1000).unref();
 
 function authUser(req: express.Request) {
   return (req as unknown as AuthedRequest).user;
