@@ -971,7 +971,11 @@ function ViewerStage({
   infoOpen?: boolean;
 }) {
   const imgRef = useRef<HTMLImageElement | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  // Track the loaded asset's id rather than a boolean: a cached preview can
+  // fire onLoad before the asset-change effect runs, and a boolean reset
+  // there would erase it and leave the blurred backdrop up forever.
+  const [loadedId, setLoadedId] = useState<string | null>(null);
+  const loaded = loadedId === asset.id;
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const swipe = useRef<{ x: number; y: number; dx: number; dy: number } | null>(null);
   const pinch = useRef<{ distance: number; scale: number } | null>(null);
@@ -982,10 +986,13 @@ function ViewerStage({
   useBackClose(true, onClose);
 
   useEffect(() => {
-    setLoaded(false);
     zoom.current = { scale: 1, tx: 0, ty: 0 };
     pinch.current = null;
     swipe.current = null;
+    // If the preview came straight from cache, load may have fired before
+    // this effect (or before React attached the listener) — catch up here.
+    const img = imgRef.current;
+    if (img && img.complete && img.naturalWidth > 0) setLoadedId(asset.id);
   }, [asset.id]);
 
   useEffect(() => {
@@ -1197,7 +1204,7 @@ function ViewerStage({
             draggable={false}
             key={asset.id}
             onDoubleClick={(event) => toggleZoom(event.clientX, event.clientY)}
-            onLoad={() => setLoaded(true)}
+            onLoad={() => setLoadedId(asset.id)}
             ref={imgRef}
             src={asset.urls.preview}
           />
