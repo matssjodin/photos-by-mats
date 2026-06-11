@@ -199,32 +199,47 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   async function uploadPhotos(files: FileList | File[] | null, albumId = activeAlbum?.id) {
     if (!files?.length) return;
     const list = Array.from(files);
-    const form = new FormData();
-    list.forEach((file) => form.append("photos", file));
+    const batches = batchForUpload(list);
+    const totalBytes = list.reduce((sum, file) => sum + file.size, 0) || 1;
+    const endpoint = albumId ? `/api/albums/${albumId}/upload` : "/api/assets";
+    let sentBytes = 0;
+    let added = 0;
+    let skipped = 0;
+    let failed = 0;
     setBusy(true);
     setUploadState({ count: list.length, percent: 0, processing: false });
     try {
-      const endpoint = albumId ? `/api/albums/${albumId}/upload` : "/api/assets";
-      const result = await uploadWithProgress(endpoint, form, (percent) =>
-        setUploadState({ count: list.length, percent, processing: percent >= 100 })
-      );
-      const added = result.assets.length;
-      const skipped = result.duplicates?.length ?? 0;
-      const failed = result.errors.length;
+      for (const batch of batches) {
+        const form = new FormData();
+        batch.forEach((file) => form.append("photos", file));
+        const result = await uploadWithProgress(endpoint, form, (loadedBytes) => {
+          const percent = Math.min(100, Math.round(((sentBytes + loadedBytes) / totalBytes) * 100));
+          setUploadState({ count: list.length, percent, processing: percent >= 100 });
+        });
+        sentBytes += batch.reduce((sum, file) => sum + file.size, 0);
+        added += result.assets.length;
+        skipped += result.duplicates?.length ?? 0;
+        failed += result.errors.length;
+      }
       const parts = [`Added ${added} photo${added === 1 ? "" : "s"}`];
       if (skipped) parts.push(`skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}`);
       if (failed) parts.push(`${failed} failed`);
       setMessage(parts.join(", "));
-      if (albumId) {
-        await loadAlbumAssets(albumId);
-        await loadAlbums();
-      } else {
-        await loadAssets("photos");
-        setView("photos");
-      }
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Upload failed.");
+      const reason = error instanceof Error ? error.message : "Upload failed.";
+      const done = added + skipped;
+      setMessage(done ? `Uploaded ${done} of ${list.length} photos, then failed: ${reason}` : reason);
     } finally {
+      // Refresh even after a mid-batch failure so already-uploaded photos show up.
+      if (added || skipped) {
+        if (albumId) {
+          await loadAlbumAssets(albumId);
+          await loadAlbums();
+        } else {
+          await loadAssets("photos");
+          setView("photos");
+        }
+      }
       setBusy(false);
       setUploadState(null);
       if (fileInput.current) fileInput.current.value = "";
@@ -1817,13 +1832,36 @@ type UploadResult = {
   errors: Array<{ name: string; error: string }>;
 };
 
-function uploadWithProgress(url: string, form: FormData, onProgress: (percent: number) => void): Promise<UploadResult> {
+// Cloudflare rejects requests over 100MB with a 413, so uploads are split
+// into batches that stay safely below that. File count is capped too so one
+// batch can't hold hundreds of tiny files.
+const UPLOAD_BATCH_BYTES = 80 * 1024 * 1024;
+const UPLOAD_BATCH_FILES = 40;
+
+function batchForUpload(files: File[]): File[][] {
+  const batches: File[][] = [];
+  let current: File[] = [];
+  let currentBytes = 0;
+  for (const file of files) {
+    if (current.length && (currentBytes + file.size > UPLOAD_BATCH_BYTES || current.length >= UPLOAD_BATCH_FILES)) {
+      batches.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(file);
+    currentBytes += file.size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function uploadWithProgress(url: string, form: FormData, onProgress: (loadedBytes: number) => void): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url);
     xhr.responseType = "json";
     xhr.upload.addEventListener("progress", (event) => {
-      if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+      if (event.lengthComputable) onProgress(event.loaded);
     });
     xhr.addEventListener("load", () => {
       const body = xhr.response as (UploadResult & { error?: string }) | null;
