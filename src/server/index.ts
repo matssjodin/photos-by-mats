@@ -826,6 +826,12 @@ const server = app.listen(port, () => {
     .then(() => migrateOriginalsToWebp())
     .catch((error) => console.error("WebP migration failed:", error));
 });
+// Node's 5s default races with the reverse proxies in front (Cloudflare and
+// Coolify's proxy reuse idle origin connections): a request sent just as Node
+// closes the socket hangs forever. Keep connections open longer than any
+// proxy's idle timeout (Traefik 90s, Caddy 2min) so Node never closes first.
+server.keepAliveTimeout = 185_000;
+server.headersTimeout = 190_000;
 
 function shutdown(signal: NodeJS.Signals) {
   console.log(`Received ${signal}, shutting down.`);
