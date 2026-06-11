@@ -476,20 +476,20 @@ app.get("/api/assets/:id/file/:variant", (req, res) => {
   }
 
   const variant = req.params.variant;
-  const relPath = variant === "original"
-    ? asset.original_path
-    : variant === "preview"
-      ? asset.preview_path
-      : variant === "thumb"
-        ? asset.thumb_path
-        : "";
+  // "original" now serves the stored 2048px WebP as a download — the
+  // uploaded source file is discarded at ingest.
+  const relPath = variant === "original" || variant === "preview"
+    ? asset.preview_path
+    : variant === "thumb"
+      ? asset.thumb_path
+      : "";
 
   if (!relPath) {
     res.status(404).json({ error: "Variant not found." });
     return;
   }
   if (variant === "original") {
-    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(asset.original_name)}"`);
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(webpDownloadName(asset.original_name))}"`);
   }
   sendAssetFile(res, relPath);
 });
@@ -552,7 +552,7 @@ app.post("/api/assets/zip", (req, res) => {
   res.setHeader("Content-Type", "application/zip");
   res.setHeader("Content-Disposition", 'attachment; filename="photos.zip"');
 
-  // Store-only: the originals are already compressed image formats.
+  // Store-only: the WebP files are already compressed.
   const archive = new ZipArchive({ store: true });
   archive.on("error", (error: Error) => {
     console.error("Zip stream failed:", error);
@@ -562,13 +562,13 @@ app.post("/api/assets/zip", (req, res) => {
 
   const usedNames = new Set<string>();
   for (const asset of assets) {
-    let name = asset.original_name || `photo${path.extname(asset.original_path)}`;
+    let name = webpDownloadName(asset.original_name);
     if (usedNames.has(name)) {
       const ext = path.extname(name);
       name = `${name.slice(0, name.length - ext.length)}-${asset.id.slice(0, 8)}${ext}`;
     }
     usedNames.add(name);
-    archive.file(path.join(dataDir, asset.original_path), { name });
+    archive.file(path.join(dataDir, asset.preview_path), { name });
   }
   void archive.finalize();
 });
@@ -821,7 +821,10 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
 
 const server = app.listen(port, () => {
   console.log(`Sjodin Photos is running on port ${port}`);
-  void backfillContentHashes().catch((error) => console.error("Hash backfill failed:", error));
+  void backfillContentHashes()
+    .catch((error) => console.error("Hash backfill failed:", error))
+    .then(() => migrateOriginalsToWebp())
+    .catch((error) => console.error("WebP migration failed:", error));
 });
 
 function shutdown(signal: NodeJS.Signals) {
@@ -1105,38 +1108,32 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 
 async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{ asset: ReturnType<typeof toPublicAsset>; duplicate: boolean }> {
   const id = crypto.randomUUID();
-  const ext = extensionFor(file.originalname, file.mimetype);
   const relativeDir = path.join("uploads", userId, id);
   const absoluteDir = path.join(dataDir, relativeDir);
-  let movedOriginal = false;
-  let absoluteOriginal = "";
 
   try {
-    await fs.mkdir(absoluteDir, { recursive: true });
-
-    const originalPath = path.join(relativeDir, `original${ext}`);
-    const previewPath = path.join(relativeDir, "preview.webp");
-    const thumbPath = path.join(relativeDir, "thumb.webp");
-    absoluteOriginal = path.join(dataDir, originalPath);
-    await fs.rename(file.path, absoluteOriginal);
-    movedOriginal = true;
-
-    const contentHash = await sha256File(absoluteOriginal);
+    // The uploaded original is discarded after processing: only the 2048px
+    // WebP and the thumbnail are kept. The dedupe hash is still computed
+    // from the uploaded bytes so re-uploads of the same source file match.
+    const contentHash = await sha256File(file.path);
     const existing = db
       .prepare("SELECT * FROM assets WHERE user_id = ? AND content_hash = ?")
       .get(userId, contentHash) as AssetRow | undefined;
     if (existing) {
-      await fs.rm(absoluteDir, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rm(file.path, { force: true }).catch(() => undefined);
       return { asset: toPublicAsset(restoreIfTrashed(existing)), duplicate: true };
     }
 
-    const metadata = await sharp(absoluteOriginal).rotate().metadata();
-    await sharp(absoluteOriginal)
+    await fs.mkdir(absoluteDir, { recursive: true });
+    const previewPath = path.join(relativeDir, "preview.webp");
+    const thumbPath = path.join(relativeDir, "thumb.webp");
+
+    const previewInfo = await sharp(file.path)
       .rotate()
-      .resize({ width: 1800, height: 1800, fit: "inside", withoutEnlargement: true })
+      .resize({ width: 2048, height: 2048, fit: "inside", withoutEnlargement: true })
       .webp({ quality: 82 })
       .toFile(path.join(dataDir, previewPath));
-    await sharp(absoluteOriginal)
+    await sharp(file.path)
       .rotate()
       .resize({ width: 560, height: 560, fit: "cover", position: "attention" })
       .webp({ quality: 76 })
@@ -1145,7 +1142,7 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
     const now = new Date().toISOString();
     let takenAt = now;
     try {
-      const tags = await parseExif(absoluteOriginal, ["DateTimeOriginal", "CreateDate"]);
+      const tags = await parseExif(file.path, ["DateTimeOriginal", "CreateDate"]);
       const exifDate = tags?.DateTimeOriginal ?? tags?.CreateDate;
       if (exifDate instanceof Date && !isNaN(exifDate.getTime())) {
         takenAt = exifDate.toISOString();
@@ -1164,13 +1161,13 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
         id,
         userId,
         file.originalname,
-        file.mimetype,
-        file.size,
-        metadata.width ?? null,
-        metadata.height ?? null,
+        "image/webp",
+        previewInfo.size,
+        previewInfo.width ?? null,
+        previewInfo.height ?? null,
         takenAt,
         now,
-        originalPath,
+        previewPath,
         previewPath,
         thumbPath,
         contentHash
@@ -1183,16 +1180,16 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
         .get(userId, contentHash) as AssetRow | undefined;
       if (!winner) throw error;
       await fs.rm(absoluteDir, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rm(file.path, { force: true }).catch(() => undefined);
       return { asset: toPublicAsset(restoreIfTrashed(winner)), duplicate: true };
     }
 
+    await fs.rm(file.path, { force: true }).catch(() => undefined);
     const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow;
     return { asset: toPublicAsset(row), duplicate: false };
   } catch (error) {
     await fs.rm(absoluteDir, { recursive: true, force: true }).catch(() => undefined);
-    if (!movedOriginal) {
-      await fs.rm(file.path, { force: true }).catch(() => undefined);
-    }
+    await fs.rm(file.path, { force: true }).catch(() => undefined);
     throw error;
   }
 }
@@ -1231,14 +1228,59 @@ async function backfillContentHashes() {
   console.log(`Backfilled content hashes for ${updated}/${rows.length} assets.`);
 }
 
-function extensionFor(filename: string, mimeType: string) {
-  const ext = path.extname(filename).toLowerCase();
-  if (ext && ext.length <= 8) return ext;
-  if (mimeType === "image/png") return ".png";
-  if (mimeType === "image/webp") return ".webp";
-  if (mimeType === "image/gif") return ".gif";
-  if (mimeType === "image/avif") return ".avif";
-  return ".jpg";
+/**
+ * One-time migration to WebP-only storage: assets ingested before this change
+ * still have a stored original (original_path differs from preview_path).
+ * Re-encode the preview at 2048px from that original, then delete it.
+ * Must run after backfillContentHashes so hashes reflect the uploaded bytes.
+ */
+async function migrateOriginalsToWebp() {
+  const rows = db.prepare("SELECT * FROM assets WHERE original_path <> preview_path").all() as AssetRow[];
+  if (!rows.length) return;
+  console.log(`Migrating ${rows.length} asset(s) to WebP-only storage...`);
+  let migrated = 0;
+  for (const row of rows) {
+    try {
+      const absoluteOriginal = path.join(dataDir, row.original_path);
+      const absolutePreview = path.join(dataDir, row.preview_path);
+      const hasOriginal = await fs.access(absoluteOriginal).then(() => true, () => false);
+      if (hasOriginal) {
+        // Write to a temp name first so a crash mid-encode can't corrupt the
+        // preview that's currently being served.
+        const tempPath = `${absolutePreview}.tmp`;
+        const info = await sharp(absoluteOriginal)
+          .rotate()
+          .resize({ width: 2048, height: 2048, fit: "inside", withoutEnlargement: true })
+          .webp({ quality: 82 })
+          .toFile(tempPath);
+        await fs.rename(tempPath, absolutePreview);
+        db.prepare(`
+          UPDATE assets
+          SET original_path = preview_path, mime_type = 'image/webp', size_bytes = ?, width = ?, height = ?
+          WHERE id = ?
+        `).run(info.size, info.width ?? null, info.height ?? null, row.id);
+        await fs.rm(absoluteOriginal, { force: true });
+      } else {
+        const stat = await fs.stat(absolutePreview).catch(() => null);
+        db.prepare(`
+          UPDATE assets
+          SET original_path = preview_path, mime_type = 'image/webp', size_bytes = COALESCE(?, size_bytes)
+          WHERE id = ?
+        `).run(stat?.size ?? null, row.id);
+      }
+      migrated += 1;
+    } catch (error) {
+      console.error(`WebP migration failed for asset ${row.id}:`, error);
+    }
+  }
+  console.log(`WebP migration finished for ${migrated}/${rows.length} asset(s).`);
+}
+
+/** Download filename for an asset: the uploaded name with a .webp extension. */
+function webpDownloadName(originalName: string) {
+  const ext = path.extname(originalName);
+  const base = ext ? originalName.slice(0, originalName.length - ext.length) : originalName;
+  return `${base || "photo"}.webp`;
 }
 
 function sendAssetFile(res: express.Response, relPath: string) {

@@ -256,7 +256,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     return new Promise<void>((resolve) => {
       confirmAction({
         title: "Delete photo permanently?",
-        body: "This removes the original, preview, and thumbnail from disk. It cannot be undone.",
+        body: "This removes the photo and its thumbnail from disk. It cannot be undone.",
         confirmLabel: "Delete permanently",
         danger: true,
         onConfirm: async () => {
@@ -369,7 +369,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     if (!ids.length) return;
     confirmAction({
       title: `Delete ${ids.length} photo${ids.length === 1 ? "" : "s"} permanently?`,
-      body: "This removes originals, previews, and thumbnails from disk. It cannot be undone.",
+      body: "This removes the photos and their thumbnails from disk. It cannot be undone.",
       confirmLabel: "Delete permanently",
       danger: true,
       onConfirm: async () => {
@@ -1294,7 +1294,7 @@ function Viewer({
       </dl>
       <div className="info-actions">
         {asset.urls.original && (
-          <a className="secondary-button" href={asset.urls.original} target="_blank" rel="noreferrer">Original</a>
+          <a className="secondary-button" href={asset.urls.original} target="_blank" rel="noreferrer">Download</a>
         )}
         {activeAlbum && (
           <button className="secondary-button" onClick={() => void onSetCover(activeAlbum.id, asset.id)} type="button">Set as cover</button>

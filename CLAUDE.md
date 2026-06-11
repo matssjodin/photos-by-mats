@@ -57,9 +57,9 @@ In production, the Express server serves `dist-client/` as static files and catc
 
 **Data layer:**
 - SQLite database at `DATA_DIR/photos.sqlite` (default `./data/photos.sqlite`)
-- Uploaded originals, previews (1800px WebP), and thumbnails (560px WebP) stored under `DATA_DIR/uploads/<userId>/<assetId>/`
+- Each asset is stored as exactly two WebP files under `DATA_DIR/uploads/<userId>/<assetId>/`: `preview.webp` (max 2048px on the longer side) and `thumb.webp` (560px). The uploaded original is **discarded after ingest** — the dedupe hash is computed from the uploaded bytes before conversion, so re-uploading the same source file still registers as a duplicate. The `original` download variant and the zip endpoint serve the 2048px WebP with the original filename's extension swapped to `.webp`. (`assets.original_path` is kept equal to `preview_path` for schema compatibility; `migrateOriginalsToWebp()` converts pre-existing assets on startup and deletes their stored originals.)
 - `sharp` handles image processing and EXIF auto-rotation on ingest
-- `multer` handles multipart uploads, staging files in `DATA_DIR/tmp/` before `ingestAsset()` moves them
+- `multer` handles multipart uploads, staging files in `DATA_DIR/tmp/` until `ingestAsset()` has converted them
 
 **Auth:** Cookie-based sessions (`sjodin_session`). Passwords hashed with PBKDF2-SHA256 (310,000 iterations). Sessions stored in SQLite. Two roles: `admin` and `user`. The `requireAuth` middleware attaches the user to the request; `requireAdmin` gates admin routes.
 
