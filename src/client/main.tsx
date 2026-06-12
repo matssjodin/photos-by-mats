@@ -1638,14 +1638,36 @@ function AddExistingModal({
   onClose: () => void;
 }) {
   const existingIds = useMemo(() => new Set(albumAssets.map((asset) => asset.id)), [albumAssets]);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const candidates = assets.filter((asset) => !existingIds.has(asset.id));
+  const groups = groupAssets(candidates);
   useBodyScrollLock();
   useBackClose(true, onClose);
 
+  function toggleAsset(assetId: string) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return next;
+    });
+  }
+
+  function toggleDay(dayAssets: Asset[]) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      const allSelected = dayAssets.every((asset) => next.has(asset.id));
+      for (const asset of dayAssets) {
+        if (allSelected) next.delete(asset.id);
+        else next.add(asset.id);
+      }
+      return next;
+    });
+  }
+
   async function submit() {
-    if (!selectedIds.length) return;
-    await onAdd(selectedIds);
+    if (!selectedIds.size) return;
+    await onAdd([...selectedIds]);
     onClose();
   }
 
@@ -1661,19 +1683,43 @@ function AddExistingModal({
             <button className="icon-button" onClick={onClose} title="Close" type="button"><X size={18} /></button>
           </div>
           {candidates.length ? (
-            <div className="picker-grid">
-              {candidates.map((asset) => {
-                const checked = selectedIds.includes(asset.id);
+            <div className="picker-scroll">
+              {groups.map((group) => {
+                const selectedCount = group.assets.reduce((count, asset) => count + (selectedIds.has(asset.id) ? 1 : 0), 0);
+                const allSelected = selectedCount === group.assets.length;
                 return (
-                  <button
-                    className={checked ? "picker-tile selected" : "picker-tile"}
-                    key={asset.id}
-                    onClick={() => setSelectedIds((current) => checked ? current.filter((id) => id !== asset.id) : [...current, asset.id])}
-                    type="button"
-                  >
-                    <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" />
-                    <span>{checked ? "Selected" : asset.originalName}</span>
-                  </button>
+                  <div className="picker-day" key={group.label}>
+                    <div className="picker-day-head">
+                      <h3>{group.label}</h3>
+                      <button className="picker-day-toggle" onClick={() => toggleDay(group.assets)} type="button">
+                        <span aria-hidden className={allSelected ? "day-checkbox checked" : "day-checkbox"} />
+                        <span>
+                          {allSelected
+                            ? "All selected"
+                            : selectedCount
+                              ? `${selectedCount} of ${group.assets.length}`
+                              : "Select day"}
+                        </span>
+                      </button>
+                    </div>
+                    <div className="picker-grid">
+                      {group.assets.map((asset) => {
+                        const checked = selectedIds.has(asset.id);
+                        return (
+                          <button
+                            className={checked ? "picker-tile selected" : "picker-tile"}
+                            key={asset.id}
+                            onClick={() => toggleAsset(asset.id)}
+                            title={asset.originalName}
+                            type="button"
+                          >
+                            <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" />
+                            <span className={checked ? "tile-checkbox checked" : "tile-checkbox"} />
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
                 );
               })}
             </div>
@@ -1682,8 +1728,8 @@ function AddExistingModal({
           )}
           <div className="modal-actions">
             <button className="secondary-button" onClick={onClose} type="button">Cancel</button>
-            <button className="primary-button" disabled={!selectedIds.length} onClick={() => void submit()} type="button">
-              Add {selectedIds.length || ""}
+            <button className="primary-button" disabled={!selectedIds.size} onClick={() => void submit()} type="button">
+              Add {selectedIds.size || ""}
             </button>
           </div>
         </section>

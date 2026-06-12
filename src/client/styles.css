@@ -1075,14 +1075,72 @@ button:disabled {
   justify-content: flex-end;
 }
 
-.picker-grid {
+.picker-scroll {
   min-height: 160px;
   overflow-y: auto;
+  padding-right: 2px;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.picker-day-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.picker-day-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.picker-day-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: none;
+  padding: 4px 6px;
+  border-radius: 8px;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.day-checkbox {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: transparent;
+}
+
+.day-checkbox.checked {
+  background: var(--accent);
+}
+
+.day-checkbox.checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0;
+  width: 6px;
+  height: 10px;
+  border: 2px solid white;
+  border-top: 0;
+  border-left: 0;
+  transform: rotate(45deg);
+}
+
+.picker-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
   gap: 6px;
-  padding-right: 2px;
-  -webkit-overflow-scrolling: touch;
 }
 
 .picker-tile {
@@ -1104,21 +1162,6 @@ button:disabled {
   height: 100%;
   display: block;
   object-fit: cover;
-}
-
-.picker-tile span {
-  position: absolute;
-  left: 4px;
-  right: 4px;
-  bottom: 4px;
-  padding: 4px 6px;
-  border-radius: 6px;
-  background: rgba(16, 42, 42, 0.74);
-  color: white;
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .empty-inline {
@@ -1471,8 +1514,11 @@ button:disabled {
     padding: 22px;
   }
 
-  .picker-grid {
+  .picker-scroll {
     min-height: 220px;
+  }
+
+  .picker-grid {
     grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
     gap: 10px;
   }
