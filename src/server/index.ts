@@ -615,12 +615,21 @@ app.post("/api/albums", (req, res) => {
 app.patch("/api/albums/:id", (req, res) => {
   const user = authUser(req);
   const albumId = String(req.params.id);
-  const { coverAssetId } = req.body as { coverAssetId?: string | null };
+  const { coverAssetId, title } = req.body as { coverAssetId?: string | null; title?: string };
 
   const existing = db.prepare("SELECT * FROM albums WHERE id = ? AND user_id = ?").get(albumId, user.id) as AlbumRow | undefined;
   if (!existing) {
     res.status(404).json({ error: "Album not found." });
     return;
+  }
+
+  if (title !== undefined) {
+    const trimmed = String(title).trim();
+    if (!trimmed) {
+      res.status(400).json({ error: "Album title is required." });
+      return;
+    }
+    db.prepare("UPDATE albums SET title = ? WHERE id = ?").run(trimmed, albumId);
   }
 
   if (coverAssetId !== undefined) {
@@ -779,8 +788,22 @@ app.delete("/api/albums/:id", (req, res) => {
     res.status(404).json({ error: "Album not found." });
     return;
   }
+
+  // ?deleteAssets=1 also moves the album's photos to the trash (they keep the
+  // normal retention window) rather than deleting files immediately.
+  let trashed = 0;
+  if (String(req.query.deleteAssets ?? "") === "1") {
+    const result = db.prepare(`
+      UPDATE assets SET trashed = 1, trashed_at = ?
+      WHERE trashed = 0 AND user_id = ? AND id IN (
+        SELECT asset_id FROM album_assets WHERE album_id = ?
+      )
+    `).run(new Date().toISOString(), user.id, albumId);
+    trashed = Number(result.changes);
+  }
+
   db.prepare("DELETE FROM albums WHERE id = ?").run(albumId);
-  res.json({ ok: true });
+  res.json({ ok: true, trashed });
 });
 
 app.use("/api", (_req, res) => {

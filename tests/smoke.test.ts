@@ -285,6 +285,52 @@ test("zip download streams owned originals and ignores foreign ids", async () =>
   assert.equal(empty.status, 404);
 });
 
+test("album rename and delete-with-photos trashes its assets", async () => {
+  const png = await makePng({ r: 80, g: 40, b: 140 });
+  const form = new FormData();
+  form.append("photos", new Blob([new Uint8Array(png)], { type: "image/png" }), "album-delete.png");
+  const upload = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+  const { assets: uploaded } = await upload.json() as { assets: Array<{ id: string }> };
+
+  const createResponse = await fetch(`${baseUrl}/api/albums`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ title: "Doomed" })
+  });
+  const { album } = await createResponse.json() as { album: { id: string } };
+  await fetch(`${baseUrl}/api/albums/${album.id}/assets`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ assetIds: [uploaded[0].id] })
+  });
+
+  const rename = await fetch(`${baseUrl}/api/albums/${album.id}`, {
+    method: "PATCH",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ title: "Renamed" })
+  });
+  assert.equal(rename.status, 200);
+  assert.equal((await rename.json() as { album: { title: string } }).album.title, "Renamed");
+
+  const emptyRename = await fetch(`${baseUrl}/api/albums/${album.id}`, {
+    method: "PATCH",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ title: "   " })
+  });
+  assert.equal(emptyRename.status, 400);
+
+  const deleteResponse = await fetch(`${baseUrl}/api/albums/${album.id}?deleteAssets=1`, {
+    method: "DELETE",
+    headers: authedHeaders()
+  });
+  assert.equal(deleteResponse.status, 200);
+  assert.equal((await deleteResponse.json() as { trashed: number }).trashed, 1);
+
+  const trashList = await fetch(`${baseUrl}/api/assets?view=trash`, { headers: authedHeaders() });
+  const { assets: trashed } = await trashList.json() as { assets: Array<{ id: string }> };
+  assert.ok(trashed.some((asset) => asset.id === uploaded[0].id), "asset should be in the trash");
+});
+
 test("re-uploading a trashed duplicate restores it", async () => {
   const png = await makePng({ r: 10, g: 120, b: 200 });
   const listBefore = await fetch(`${baseUrl}/api/assets?view=photos`, { headers: authedHeaders() });

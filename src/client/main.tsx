@@ -13,6 +13,7 @@ import {
   Images,
   Info,
   LogOut,
+  Pencil,
   Plus,
   RotateCcw,
   Search,
@@ -120,6 +121,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [uploadState, setUploadState] = useState<{ count: number; percent: number; processing: boolean } | null>(null);
   const [albumPickOpen, setAlbumPickOpen] = useState(false);
   const [addModalOpen, setAddModalOpen] = useState(false);
+  const [editAlbumOpen, setEditAlbumOpen] = useState(false);
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>([]);
   const [confirmState, setConfirmState] = useState<ConfirmRequest | null>(null);
   const [linkPrompt, setLinkPrompt] = useState<string | null>(null);
@@ -315,6 +317,40 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
     const data = await api<{ assets: Asset[] }>("/api/assets?view=photos");
     setLibraryAssets(data.assets);
     setAddModalOpen(true);
+  }
+
+  async function renameAlbum(title: string) {
+    if (!activeAlbum) return;
+    const data = await api<{ album: Album }>(`/api/albums/${activeAlbum.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title })
+    });
+    setAlbums((current) => current.map((item) => item.id === data.album.id ? { ...item, title: data.album.title } : item));
+    setActiveAlbum((current) => current?.id === data.album.id ? { ...current, title: data.album.title } : current);
+    setEditAlbumOpen(false);
+    setMessage("Album renamed");
+  }
+
+  function requestDeleteAlbum(deleteAssets: boolean) {
+    if (!activeAlbum) return;
+    const album = activeAlbum;
+    const count = album.assetCount;
+    confirmAction({
+      title: deleteAssets ? `Delete "${album.title}" and its photos?` : `Delete "${album.title}"?`,
+      body: deleteAssets
+        ? `The album is removed and its ${count} photo${count === 1 ? "" : "s"} move to the trash.`
+        : "Only the album is removed — its photos stay in your library.",
+      confirmLabel: "Delete album",
+      danger: true,
+      onConfirm: async () => {
+        await api(`/api/albums/${album.id}${deleteAssets ? "?deleteAssets=1" : ""}`, { method: "DELETE" });
+        setEditAlbumOpen(false);
+        setActiveAlbum(null);
+        setAlbums((current) => current.filter((item) => item.id !== album.id));
+        await loadAlbums();
+        setMessage(deleteAssets ? "Album deleted, photos moved to trash" : "Album deleted");
+      }
+    });
   }
 
   async function shareAlbum(album: Album) {
@@ -566,6 +602,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
               busy={busy}
               onAddExisting={openAddModal}
               onBack={() => setActiveAlbum(null)}
+              onEditAlbum={() => setEditAlbumOpen(true)}
               onSelect={setSelected}
               onSetCover={activeAlbum ? setCoverPhoto : undefined}
               onShare={shareAlbum}
@@ -641,6 +678,15 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
           assets={libraryAssets}
           onAdd={(ids) => addToAlbum(activeAlbum.id, ids)}
           onClose={() => setAddModalOpen(false)}
+        />
+      )}
+
+      {editAlbumOpen && activeAlbum && (
+        <EditAlbumModal
+          album={activeAlbum}
+          onClose={() => setEditAlbumOpen(false)}
+          onDelete={requestDeleteAlbum}
+          onRename={renameAlbum}
         />
       )}
 
@@ -1351,6 +1397,7 @@ function LibraryView({
   busy,
   onAddExisting,
   onBack,
+  onEditAlbum = () => {},
   onSelect,
   onSetCover,
   onShare,
@@ -1365,6 +1412,7 @@ function LibraryView({
   busy: boolean;
   onAddExisting: () => void;
   onBack: () => void;
+  onEditAlbum?: () => void;
   onSelect: (asset: Asset) => void;
   onSetCover?: (albumId: string, assetId: string) => Promise<void>;
   onShare: (album: Album) => Promise<void>;
@@ -1425,7 +1473,7 @@ function LibraryView({
     return (
       <section className="empty-state">
         {activeAlbum && (
-          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onShare={onShare} onUpload={onUpload} />
+          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUpload={onUpload} />
         )}
         <div className="empty-icon"><Images size={38} /></div>
         <h2>No photos here</h2>
@@ -1441,7 +1489,7 @@ function LibraryView({
     <>
       <section className="library">
         {activeAlbum && (
-          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onShare={onShare} onUpload={onUpload} />
+          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUpload={onUpload} />
         )}
         {groupAssets(assets).map((group) => (
           <div className="date-group" key={group.label}>
@@ -1535,12 +1583,14 @@ function AlbumActionBar({
   album,
   onAddExisting,
   onBack,
+  onEdit,
   onShare,
   onUpload
 }: {
   album: Album;
   onAddExisting: () => void;
   onBack: () => void;
+  onEdit: () => void;
   onShare: (album: Album) => Promise<void>;
   onUpload: () => void;
 }) {
@@ -1550,6 +1600,10 @@ function AlbumActionBar({
         <ChevronLeft size={18} /> Albums
       </button>
       <div>
+        <button className="secondary-button" onClick={onEdit} type="button">
+          <Pencil size={18} />
+          <span>Edit</span>
+        </button>
         <button className="secondary-button" onClick={onAddExisting} type="button">
           <Images size={18} />
           <span>Add existing</span>
@@ -1731,6 +1785,74 @@ function AddExistingModal({
             <button className="primary-button" disabled={!selectedIds.size} onClick={() => void submit()} type="button">
               Add {selectedIds.size || ""}
             </button>
+          </div>
+        </section>
+      </div>
+    </Overlay>
+  );
+}
+
+function EditAlbumModal({
+  album,
+  onClose,
+  onDelete,
+  onRename
+}: {
+  album: Album;
+  onClose: () => void;
+  onDelete: (deleteAssets: boolean) => void;
+  onRename: (title: string) => Promise<void>;
+}) {
+  const [title, setTitle] = useState(album.title);
+  const [deleteAssets, setDeleteAssets] = useState(false);
+  const trimmed = title.trim();
+  useBodyScrollLock();
+  useBackClose(true, onClose);
+
+  return (
+    <Overlay>
+      <div className="modal-backdrop" onClick={onClose}>
+        <section className="modal" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-head">
+            <div>
+              <p className="eyebrow">Album settings</p>
+              <h2>{album.title}</h2>
+            </div>
+            <button className="icon-button" onClick={onClose} title="Close" type="button"><X size={18} /></button>
+          </div>
+          <div className="edit-album-body">
+            <form
+              className="edit-album-rename"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (trimmed && trimmed !== album.title) void onRename(trimmed);
+              }}
+            >
+              <input
+                aria-label="Album title"
+                onChange={(event) => setTitle(event.target.value)}
+                value={title}
+              />
+              <button className="primary-button" disabled={!trimmed || trimmed === album.title} type="submit">
+                Rename
+              </button>
+            </form>
+            <div className="danger-zone">
+              <label className="check-label">
+                <input
+                  checked={deleteAssets}
+                  onChange={(event) => setDeleteAssets(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>
+                  Also move the album&apos;s {album.assetCount} photo{album.assetCount === 1 ? "" : "s"} to the trash
+                </span>
+              </label>
+              <button className="danger-button" onClick={() => onDelete(deleteAssets)} type="button">
+                <Trash2 size={18} />
+                <span>Delete album</span>
+              </button>
+            </div>
           </div>
         </section>
       </div>
