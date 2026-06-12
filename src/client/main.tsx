@@ -153,6 +153,13 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
   const [confirmState, setConfirmState] = useState<ConfirmRequest | null>(null);
   const [linkPrompt, setLinkPrompt] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
+  // Session cache of each album's photos: opening a cached album renders
+  // instantly and a background fetch revalidates it (stale-while-revalidate).
+  const albumAssetsCache = useRef(new Map<string, Asset[]>());
+  // Synced during render so async loads can tell whether their response still
+  // belongs to what the user is looking at.
+  const activeAlbumIdRef = useRef<string | null>(null);
+  activeAlbumIdRef.current = activeAlbum?.id ?? null;
 
   useEffect(() => {
     if (!message || busy) return;
@@ -204,7 +211,8 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     setBusy(true);
     try {
       const data = await api<{ assets: Asset[] }>(`/api/assets?view=${nextView}&q=${encodeURIComponent(search)}`);
-      setAssets(data.assets);
+      // A slow response must not clobber an album the user has since opened.
+      if (!activeAlbumIdRef.current) setAssets(data.assets);
     } finally {
       setBusy(false);
     }
@@ -216,13 +224,32 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
   }
 
   async function loadAlbumAssets(albumId: string) {
-    setBusy(true);
+    const cached = albumAssetsCache.current.get(albumId);
+    if (cached) {
+      // Render the cached contents instantly; the fetch below revalidates.
+      setAssets(cached);
+    } else {
+      // Never show the previous view's photos while the album loads.
+      setAssets([]);
+      setBusy(true);
+    }
     try {
       const data = await api<{ assets: Asset[] }>(`/api/albums/${albumId}/assets`);
-      setAssets(data.assets);
+      albumAssetsCache.current.set(albumId, data.assets);
+      if (activeAlbumIdRef.current === albumId) setAssets(data.assets);
     } finally {
-      setBusy(false);
+      if (!cached) setBusy(false);
     }
+  }
+
+  /** Edits the visible assets and keeps the open album's cache in sync. */
+  function patchAssets(updater: (current: Asset[]) => Asset[]) {
+    setAssets((current) => {
+      const next = updater(current);
+      const albumId = activeAlbumIdRef.current;
+      if (albumId) albumAssetsCache.current.set(albumId, next);
+      return next;
+    });
   }
 
   async function uploadPhotos(files: FileList | File[] | null, albumId = activeAlbum?.id) {
@@ -290,7 +317,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     } else {
       setSelected((current) => current?.id === data.asset.id ? data.asset : current);
     }
-    setAssets((current) => removesFromView
+    patchAssets((current) => removesFromView
       ? current.filter((item) => item.id !== data.asset.id)
       : current.map((item) => item.id === data.asset.id ? data.asset : item));
     if (patch.trashed !== undefined) void loadAlbums();
@@ -306,7 +333,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
         onConfirm: async () => {
           await api(`/api/assets/${asset.id}`, { method: "DELETE" });
           setSelected(null);
-          setAssets((current) => current.filter((item) => item.id !== asset.id));
+          patchAssets((current) => current.filter((item) => item.id !== asset.id));
           void loadAlbums();
           resolve();
         },
@@ -322,6 +349,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     });
     setAlbums((current) => [data.album, ...current]);
     setActiveAlbum(data.album);
+    albumAssetsCache.current.set(data.album.id, []);
     if (files?.length) {
       await uploadPhotos(files, data.album.id);
     } else {
@@ -338,6 +366,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     });
     await loadAlbums();
     if (activeAlbum?.id === albumId) await loadAlbumAssets(albumId);
+    else albumAssetsCache.current.delete(albumId);
   }
 
   async function openAddModal() {
@@ -355,6 +384,8 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
       danger: true,
       onConfirm: async () => {
         await api("/api/trash/empty", { method: "POST" });
+        // Purged photos may sit in cached albums too.
+        albumAssetsCache.current.clear();
         await loadAssets(view);
         void loadAlbums();
         setMessage("Trash emptied");
@@ -387,6 +418,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
       danger: true,
       onConfirm: async () => {
         await api(`/api/albums/${album.id}${deleteAssets ? "?deleteAssets=1" : ""}`, { method: "DELETE" });
+        albumAssetsCache.current.delete(album.id);
         setEditAlbumOpen(false);
         setActiveAlbum(null);
         setAlbums((current) => current.filter((item) => item.id !== album.id));
@@ -469,6 +501,8 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
       onConfirm: async () => {
         clearSelect();
         await Promise.all(ids.map((id) => api(`/api/assets/${id}`, { method: "DELETE" })));
+        // Permanently deleted photos may sit in cached albums too.
+        albumAssetsCache.current.clear();
         await loadAssets(view);
         void loadAlbums();
       }
