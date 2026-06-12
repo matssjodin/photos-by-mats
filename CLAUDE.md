@@ -77,6 +77,8 @@ In production, the Express server serves `dist-client/` as static files and catc
 | `MAX_UPLOAD_FILE_SIZE_MB` | `120` | Max file size per upload |
 | `INGEST_CONCURRENCY` | `3` | Parallel sharp workers during upload ingest |
 | `TRASH_RETENTION_DAYS` | `30` | Days before trashed photos are permanently purged (0 disables) |
+| `APP_NAME` | `Sjodin Photos` | White-label display name (UI, page title, PWA manifest via `GET /api/config` and the dynamic `/manifest.webmanifest` route) |
+| `APP_SHORT_NAME` | `Photos` | PWA home-screen label |
 
 If no users exist and `ADMIN_EMAIL`/`ADMIN_PASSWORD` are not set, a dev admin `admin@example.com` / `change-me-before-deploy` is created.
 

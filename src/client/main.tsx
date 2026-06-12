@@ -85,6 +85,7 @@ const SWIPE_CLOSE_THRESHOLD = 90;
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [booting, setBooting] = useState(true);
+  const [appName, setAppName] = useState("");
   const shareToken = window.location.pathname.startsWith("/share/")
     ? window.location.pathname.split("/").filter(Boolean)[1]
     : null;
@@ -100,13 +101,22 @@ function App() {
       .finally(() => setBooting(false));
   }, [shareToken]);
 
+  useEffect(() => {
+    api<{ appName: string }>("/api/config")
+      .then((data) => {
+        setAppName(data.appName);
+        document.title = data.appName;
+      })
+      .catch(() => setAppName("Sjodin Photos"));
+  }, []);
+
   if (booting) return <Splash />;
-  if (shareToken) return <SharedAlbum token={shareToken} />;
-  if (!user) return <Login onLogin={setUser} />;
-  return <PhotosApp user={user} onLogout={() => setUser(null)} />;
+  if (shareToken) return <SharedAlbum appName={appName} token={shareToken} />;
+  if (!user) return <Login appName={appName} onLogin={setUser} />;
+  return <PhotosApp appName={appName} user={user} onLogout={() => setUser(null)} />;
 }
 
-function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
+function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; onLogout: () => void }) {
   const [view, setView] = useState<View>("photos");
   const [assets, setAssets] = useState<Asset[]>([]);
   const [albums, setAlbums] = useState<Album[]>([]);
@@ -498,7 +508,7 @@ function PhotosApp({ user, onLogout }: { user: User; onLogout: () => void }) {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><Camera size={22} /></div>
-          <span>Sjodin Photos</span>
+          <span>{appName}</span>
         </div>
         <nav className="nav-list">
           {navItems.map((item) => (
@@ -893,7 +903,7 @@ function LinkPrompt({ url, onClose }: { url: string; onClose: () => void }) {
   );
 }
 
-function Login({ onLogin }: { onLogin: (user: User) => void }) {
+function Login({ appName, onLogin }: { appName: string; onLogin: (user: User) => void }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -921,7 +931,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
       <form className="login-panel" onSubmit={submit}>
         <div className="brand login-brand">
           <div className="brand-mark"><Camera size={24} /></div>
-          <span>Sjodin Photos</span>
+          <span>{appName}</span>
         </div>
         <h1>Welcome back</h1>
         <label>
@@ -942,7 +952,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
   );
 }
 
-function SharedAlbum({ token }: { token: string }) {
+function SharedAlbum({ appName, token }: { appName: string; token: string }) {
   const [album, setAlbum] = useState<Album | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [selected, setSelected] = useState<Asset | null>(null);
@@ -975,7 +985,7 @@ function SharedAlbum({ token }: { token: string }) {
       <header className="shared-header">
         <div className="brand">
           <div className="brand-mark"><Camera size={22} /></div>
-          <span>Sjodin Photos</span>
+          <span>{appName}</span>
         </div>
         <div>
           <p className="eyebrow">{assets.length} item{assets.length === 1 ? "" : "s"}</p>

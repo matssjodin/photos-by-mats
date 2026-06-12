@@ -28,6 +28,9 @@ const isProduction = process.env.NODE_ENV === "production";
 const appOrigin = process.env.APP_ORIGIN?.replace(/\/$/, "");
 const ingestConcurrency = Math.max(1, Number(process.env.INGEST_CONCURRENCY ?? 3));
 const trashRetentionDays = Number(process.env.TRASH_RETENTION_DAYS ?? 30);
+// White-label branding: shown in the UI, the page title, and the PWA manifest.
+const appName = (process.env.APP_NAME ?? "").trim() || "Sjodin Photos";
+const appShortName = (process.env.APP_SHORT_NAME ?? "").trim() || "Photos";
 
 const loginAttempts = new Map<string, { count: number; firstAttempt: number; lockedUntil: number }>();
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -195,6 +198,10 @@ app.use(csrfGuard);
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/api/config", (_req, res) => {
+  res.json({ appName, appShortName });
 });
 
 app.get("/api/share/:token", (req, res) => {
@@ -816,6 +823,32 @@ app.post("/share-target", (_req, res) => {
   res.redirect(303, "/");
 });
 
+// Served dynamically (before the static dist-client copy) so APP_NAME and
+// APP_SHORT_NAME white-label the installed PWA without a rebuild.
+app.get("/manifest.webmanifest", (_req, res) => {
+  res.type("application/manifest+json").json({
+    name: appName,
+    short_name: appShortName,
+    description: `${appName} — private photo library`,
+    start_url: "/",
+    scope: "/",
+    display: "standalone",
+    background_color: "#f6f4ee",
+    theme_color: "#102a2a",
+    icons: [
+      { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
+      { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png" },
+      { src: "/icons/maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
+    ],
+    share_target: {
+      action: "/share-target",
+      method: "POST",
+      enctype: "multipart/form-data",
+      params: { files: [{ name: "photos", accept: ["image/*"] }] }
+    }
+  });
+});
+
 app.use(express.static(clientDir));
 app.get(/.*/, async (_req, res) => {
   res.sendFile(path.join(clientDir, "index.html"));
@@ -843,7 +876,7 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
 });
 
 const server = app.listen(port, () => {
-  console.log(`Sjodin Photos is running on port ${port}`);
+  console.log(`${appName} is running on port ${port}`);
   void backfillContentHashes()
     .catch((error) => console.error("Hash backfill failed:", error))
     .then(() => migrateOriginalsToWebp())

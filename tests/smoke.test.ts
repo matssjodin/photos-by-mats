@@ -72,6 +72,19 @@ test("health endpoint responds with security headers", async () => {
   assert.ok(response.headers.get("content-security-policy")?.includes("default-src 'self'"));
 });
 
+test("branding config and PWA manifest reflect APP_NAME defaults", async () => {
+  const config = await fetch(`${baseUrl}/api/config`);
+  assert.equal(config.status, 200);
+  assert.deepEqual(await config.json(), { appName: "Sjodin Photos", appShortName: "Photos" });
+
+  const manifest = await fetch(`${baseUrl}/manifest.webmanifest`);
+  assert.equal(manifest.status, 200);
+  const body = await manifest.json() as { name: string; short_name: string; share_target: unknown };
+  assert.equal(body.name, "Sjodin Photos");
+  assert.equal(body.short_name, "Photos");
+  assert.ok(body.share_target, "manifest must keep the share_target");
+});
+
 test("state-changing request without Origin/Referer is rejected (CSRF guard)", async () => {
   const response = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
