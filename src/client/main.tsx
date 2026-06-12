@@ -82,10 +82,24 @@ const LONG_PRESS_MOVE_TOLERANCE = 10;
 const SWIPE_NAVIGATE_THRESHOLD = 60;
 const SWIPE_CLOSE_THRESHOLD = 90;
 
+type AppConfig = {
+  appName: string;
+  appShortName: string;
+  attributionText: string;
+  attributionUrl: string;
+};
+
+const fallbackConfig: AppConfig = {
+  appName: "Sjodin Photos",
+  appShortName: "Photos",
+  attributionText: "",
+  attributionUrl: ""
+};
+
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [booting, setBooting] = useState(true);
-  const [appName, setAppName] = useState("");
+  const [config, setConfig] = useState<AppConfig | null>(null);
   const shareToken = window.location.pathname.startsWith("/share/")
     ? window.location.pathname.split("/").filter(Boolean)[1]
     : null;
@@ -102,16 +116,19 @@ function App() {
   }, [shareToken]);
 
   useEffect(() => {
-    api<{ appName: string }>("/api/config")
+    api<AppConfig>("/api/config")
       .then((data) => {
-        setAppName(data.appName);
+        setConfig(data);
         document.title = data.appName;
       })
-      .catch(() => setAppName("Sjodin Photos"));
+      .catch(() => setConfig(fallbackConfig));
   }, []);
 
+  const appName = config?.appName ?? "";
   if (booting) return <Splash />;
-  if (shareToken) return <SharedAlbum appName={appName} token={shareToken} />;
+  if (shareToken) {
+    return <SharedAlbum appName={appName} attribution={config ?? fallbackConfig} token={shareToken} />;
+  }
   if (!user) return <Login appName={appName} onLogin={setUser} />;
   return <PhotosApp appName={appName} user={user} onLogout={() => setUser(null)} />;
 }
@@ -952,7 +969,15 @@ function Login({ appName, onLogin }: { appName: string; onLogin: (user: User) =>
   );
 }
 
-function SharedAlbum({ appName, token }: { appName: string; token: string }) {
+function SharedAlbum({
+  appName,
+  attribution,
+  token
+}: {
+  appName: string;
+  attribution: Pick<AppConfig, "attributionText" | "attributionUrl">;
+  token: string;
+}) {
   const [album, setAlbum] = useState<Album | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [selected, setSelected] = useState<Asset | null>(null);
@@ -1008,6 +1033,15 @@ function SharedAlbum({ appName, token }: { appName: string; token: string }) {
           <div className="empty-icon"><Images size={38} /></div>
           <h2>No photos in this shared album</h2>
         </div>
+      )}
+      {attribution.attributionText && (
+        <footer className="shared-footer">
+          {attribution.attributionUrl ? (
+            <a href={attribution.attributionUrl} rel="noreferrer">{attribution.attributionText}</a>
+          ) : (
+            <span>{attribution.attributionText}</span>
+          )}
+        </footer>
       )}
       {selected && (
         <SharedViewer asset={selected} assets={assets} onClose={() => setSelected(null)} onSelect={setSelected} />

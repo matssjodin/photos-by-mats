@@ -82,6 +82,8 @@ The product name is not hard-coded. Set these to rebrand the whole app — UI, l
 |---|---|---|
 | `APP_NAME` | `Sjodin Photos` | Display name shown in the sidebar, login screen, shared pages, page title, and PWA manifest |
 | `APP_SHORT_NAME` | `Photos` | Short label under the home-screen icon when installed as a PWA |
+| `ATTRIBUTION_TEXT` | `Photoalbum by Mats Sjödin` | Subtle footer link on shared album pages. Set to an empty string to hide the footer |
+| `ATTRIBUTION_URL` | `https://matssjodin.com` | Where the footer link points |
 
 To complete a rebrand, also replace the icons in `public/icons/` (or regenerate them with `node scripts/make-icons.mjs`).
 

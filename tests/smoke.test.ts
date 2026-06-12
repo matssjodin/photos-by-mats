@@ -75,7 +75,12 @@ test("health endpoint responds with security headers", async () => {
 test("branding config and PWA manifest reflect APP_NAME defaults", async () => {
   const config = await fetch(`${baseUrl}/api/config`);
   assert.equal(config.status, 200);
-  assert.deepEqual(await config.json(), { appName: "Sjodin Photos", appShortName: "Photos" });
+  assert.deepEqual(await config.json(), {
+    appName: "Sjodin Photos",
+    appShortName: "Photos",
+    attributionText: "Photoalbum by Mats Sjödin",
+    attributionUrl: "https://matssjodin.com"
+  });
 
   const manifest = await fetch(`${baseUrl}/manifest.webmanifest`);
   assert.equal(manifest.status, 200);

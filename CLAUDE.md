@@ -79,6 +79,7 @@ In production, the Express server serves `dist-client/` as static files and catc
 | `TRASH_RETENTION_DAYS` | `30` | Days before trashed photos are permanently purged (0 disables) |
 | `APP_NAME` | `Sjodin Photos` | White-label display name (UI, page title, PWA manifest via `GET /api/config` and the dynamic `/manifest.webmanifest` route) |
 | `APP_SHORT_NAME` | `Photos` | PWA home-screen label |
+| `ATTRIBUTION_TEXT` / `ATTRIBUTION_URL` | `Photoalbum by Mats Sjödin` / `https://matssjodin.com` | Footer link on shared album pages; empty text hides it |
 
 If no users exist and `ADMIN_EMAIL`/`ADMIN_PASSWORD` are not set, a dev admin `admin@example.com` / `change-me-before-deploy` is created.
 

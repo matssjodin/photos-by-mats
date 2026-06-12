@@ -1241,6 +1241,22 @@ button:disabled {
   padding: 18px 14px 48px;
 }
 
+.shared-footer {
+  margin-top: 44px;
+  text-align: center;
+  font-size: 13px;
+}
+
+.shared-footer a,
+.shared-footer span {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.shared-footer a:hover {
+  text-decoration: underline;
+}
+
 .shared-header {
   display: grid;
   gap: 18px;

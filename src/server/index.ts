@@ -31,6 +31,10 @@ const trashRetentionDays = Number(process.env.TRASH_RETENTION_DAYS ?? 30);
 // White-label branding: shown in the UI, the page title, and the PWA manifest.
 const appName = (process.env.APP_NAME ?? "").trim() || "Sjodin Photos";
 const appShortName = (process.env.APP_SHORT_NAME ?? "").trim() || "Photos";
+// Attribution link shown at the bottom of shared album pages. Defaults apply
+// when the variables are unset; set ATTRIBUTION_TEXT="" to hide it entirely.
+const attributionText = (process.env.ATTRIBUTION_TEXT ?? "Photoalbum by Mats Sjödin").trim();
+const attributionUrl = (process.env.ATTRIBUTION_URL ?? "https://matssjodin.com").trim();
 
 const loginAttempts = new Map<string, { count: number; firstAttempt: number; lockedUntil: number }>();
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -201,7 +205,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.get("/api/config", (_req, res) => {
-  res.json({ appName, appShortName });
+  res.json({ appName, appShortName, attributionText, attributionUrl });
 });
 
 app.get("/api/share/:token", (req, res) => {
