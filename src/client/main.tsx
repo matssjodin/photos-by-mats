@@ -346,6 +346,22 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     setAddModalOpen(true);
   }
 
+  function emptyTrash() {
+    const count = assets.length;
+    confirmAction({
+      title: "Empty trash?",
+      body: `This permanently deletes ${count} photo${count === 1 ? "" : "s"} from disk. It cannot be undone.`,
+      confirmLabel: "Empty trash",
+      danger: true,
+      onConfirm: async () => {
+        await api("/api/trash/empty", { method: "POST" });
+        await loadAssets(view);
+        void loadAlbums();
+        setMessage("Trash emptied");
+      }
+    });
+  }
+
   async function renameAlbum(title: string) {
     if (!activeAlbum) return;
     const data = await api<{ album: Album }>(`/api/albums/${activeAlbum.id}`, {
@@ -615,7 +631,15 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
         </header>
 
         {view === "trash" && (
-          <p className="view-note">Photos in the trash are deleted permanently after 30 days.</p>
+          <div className="view-note trash-note">
+            <p>Photos in the trash are deleted permanently after 30 days.</p>
+            {assets.length > 0 && (
+              <button className="danger-button" onClick={emptyTrash} type="button">
+                <Trash2 size={16} />
+                <span>Empty trash now</span>
+              </button>
+            )}
+          </div>
         )}
         {view === "admin" ? (
           <AdminPanel currentUser={user} />

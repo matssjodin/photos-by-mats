@@ -336,6 +336,25 @@ button:disabled {
   font-size: 14px;
 }
 
+.trash-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.trash-note p {
+  margin: 0;
+}
+
+.trash-note .danger-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
 /* ---------- Library ---------- */
 
 .library {

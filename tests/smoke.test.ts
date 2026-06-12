@@ -349,6 +349,31 @@ test("album rename and delete-with-photos trashes its assets", async () => {
   assert.ok(trashed.some((asset) => asset.id === uploaded[0].id), "asset should be in the trash");
 });
 
+test("empty trash permanently deletes all trashed photos", async () => {
+  const png = await makePng({ r: 5, g: 200, b: 90 });
+  const form = new FormData();
+  form.append("photos", new Blob([new Uint8Array(png)], { type: "image/png" }), "empty-trash.png");
+  const upload = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+  const { assets: uploaded } = await upload.json() as { assets: Array<{ id: string }> };
+
+  await fetch(`${baseUrl}/api/assets/${uploaded[0].id}`, {
+    method: "PATCH",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ trashed: true })
+  });
+
+  const empty = await fetch(`${baseUrl}/api/trash/empty`, { method: "POST", headers: authedHeaders() });
+  assert.equal(empty.status, 200);
+  assert.equal((await empty.json() as { deleted: number }).deleted >= 1, true);
+
+  const trashList = await fetch(`${baseUrl}/api/assets?view=trash`, { headers: authedHeaders() });
+  const { assets: remaining } = await trashList.json() as { assets: unknown[] };
+  assert.equal(remaining.length, 0);
+
+  const gone = await fetch(`${baseUrl}/api/assets/${uploaded[0].id}/file/thumb`, { headers: authedHeaders() });
+  assert.equal(gone.status, 404);
+});
+
 test("re-uploading a trashed duplicate restores it", async () => {
   const png = await makePng({ r: 10, g: 120, b: 200 });
   const listBefore = await fetch(`${baseUrl}/api/assets?view=photos`, { headers: authedHeaders() });

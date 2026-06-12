@@ -548,6 +548,15 @@ app.delete("/api/assets/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/trash/empty", async (req, res) => {
+  const user = authUser(req);
+  const trashed = db.prepare("SELECT * FROM assets WHERE user_id = ? AND trashed = 1").all(user.id) as AssetRow[];
+  for (const asset of trashed) {
+    await deleteAssetCompletely(asset);
+  }
+  res.json({ ok: true, deleted: trashed.length });
+});
+
 app.post("/api/assets/zip", (req, res) => {
   const user = authUser(req);
   const { assetIds } = req.body as { assetIds?: string[] };
