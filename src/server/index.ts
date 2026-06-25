@@ -35,6 +35,14 @@ const isProduction = process.env.NODE_ENV === "production";
 const appOrigin = process.env.APP_ORIGIN?.replace(/\/$/, "");
 const ingestConcurrency = Math.max(1, Number(process.env.INGEST_CONCURRENCY ?? 3));
 const videoConcurrency = Math.max(1, Number(process.env.VIDEO_CONCURRENCY ?? 1));
+// Video transcode quality knobs. Lower CRF = higher quality/larger files;
+// higher CRF = more compression. maxrate (kbps) caps the peak bitrate so
+// playback streams smoothly even on modest server upload bandwidth.
+const videoPreset = (process.env.VIDEO_PRESET ?? "medium").trim() || "medium";
+const videoHdCrf = Number(process.env.VIDEO_HD_CRF ?? 23);
+const videoSdCrf = Number(process.env.VIDEO_SD_CRF ?? 26);
+const videoHdMaxrateKbps = Number(process.env.VIDEO_HD_MAXRATE_KBPS ?? 6000);
+const videoSdMaxrateKbps = Number(process.env.VIDEO_SD_MAXRATE_KBPS ?? 1500);
 const trashRetentionDays = Number(process.env.TRASH_RETENTION_DAYS ?? 30);
 // White-label branding: shown in the UI, the page title, and the PWA manifest.
 const appName = (process.env.APP_NAME ?? "").trim() || "Sjodin Photos";
@@ -1449,8 +1457,10 @@ async function transcodeAsset(assetId: string) {
 
   try {
     const portrait = (row.height ?? 0) > (row.width ?? 0);
-    await runFfmpeg(transcodeArgs(sourcePath, path.join(dataDir, row.video_path), portrait ? 1080 : 1920, portrait ? 1920 : 1080, 23, "128k"));
-    await runFfmpeg(transcodeArgs(sourcePath, path.join(dataDir, row.video_sd_path), portrait ? 480 : 854, portrait ? 854 : 480, 26, "96k"));
+    await runFfmpeg(transcodeArgs(sourcePath, path.join(dataDir, row.video_path), portrait ? 1080 : 1920, portrait ? 1920 : 1080,
+      { crf: videoHdCrf, maxrateKbps: videoHdMaxrateKbps, audioBitrate: "128k" }));
+    await runFfmpeg(transcodeArgs(sourcePath, path.join(dataDir, row.video_sd_path), portrait ? 480 : 854, portrait ? 854 : 480,
+      { crf: videoSdCrf, maxrateKbps: videoSdMaxrateKbps, audioBitrate: "96k" }));
 
     const stat = await fs.stat(path.join(dataDir, row.video_path)).catch(() => null);
     db.prepare("UPDATE assets SET status = 'ready', size_bytes = ? WHERE id = ?")
@@ -1462,19 +1472,35 @@ async function transcodeAsset(assetId: string) {
   }
 }
 
-/** Build ffmpeg args for one H.264/AAC faststart MP4 that fits within boxW×boxH (no upscaling). */
-function transcodeArgs(source: string, out: string, boxW: number, boxH: number, crf: number, audioBitrate: string): string[] {
+/**
+ * Build ffmpeg args for one H.264/AAC faststart MP4 that fits within boxW×boxH
+ * (no upscaling). CRF sets the quality target; maxrate/bufsize cap the peak
+ * bitrate so even high-motion footage streams smoothly. A keyframe every ~2s
+ * keeps seeking (and the HD/SD quality toggle) responsive.
+ */
+function transcodeArgs(
+  source: string,
+  out: string,
+  boxW: number,
+  boxH: number,
+  opts: { crf: number; maxrateKbps: number; audioBitrate: string }
+): string[] {
   const scale = `scale=w=${boxW}:h=${boxH}:force_original_aspect_ratio=decrease:force_divisible_by=2`;
   return [
     "-y",
     "-i", source,
     "-vf", scale,
     "-c:v", "libx264",
-    "-preset", "medium",
-    "-crf", String(crf),
+    "-preset", videoPreset,
+    "-crf", String(opts.crf),
+    "-maxrate", `${opts.maxrateKbps}k`,
+    "-bufsize", `${opts.maxrateKbps * 2}k`,
+    "-profile:v", "high",
+    "-level", "4.1",
+    "-force_key_frames", "expr:gte(t,n_forced*2)",
     "-pix_fmt", "yuv420p",
     "-c:a", "aac",
-    "-b:a", audioBitrate,
+    "-b:a", opts.audioBitrate,
     "-movflags", "+faststart",
     out
   ];
