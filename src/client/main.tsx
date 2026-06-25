@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { createPortal } from "react-dom";
 import {
   Archive,
+  AlertTriangle,
   Camera,
   ChevronLeft,
   ChevronRight,
@@ -12,8 +13,10 @@ import {
   ImagePlus,
   Images,
   Info,
+  Loader,
   LogOut,
   Pencil,
+  Play,
   Plus,
   RotateCcw,
   Search,
@@ -51,10 +54,15 @@ type Asset = {
   favorite: boolean;
   archived: boolean;
   trashed: boolean;
+  mediaType: "image" | "video";
+  status: "processing" | "ready" | "failed";
+  durationMs: number | null;
   urls: {
     thumb: string;
     preview: string;
     original: string | null;
+    video: string | null;
+    videoSd: string | null;
   };
 };
 
@@ -207,6 +215,15 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     loadAssets(view);
   }, [view, activeAlbum?.id]);
 
+  // While any visible video is still transcoding, quietly re-fetch so it flips
+  // from the "Processing…" badge to a playable tile without a manual refresh.
+  const hasProcessing = assets.some((asset) => asset.status === "processing");
+  useEffect(() => {
+    if (!hasProcessing) return;
+    const interval = setInterval(() => void refreshForProcessing(), 5000);
+    return () => clearInterval(interval);
+  }, [hasProcessing, view]);
+
   async function loadAssets(nextView = view) {
     setBusy(true);
     try {
@@ -239,6 +256,23 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
       if (activeAlbumIdRef.current === albumId) setAssets(data.assets);
     } finally {
       if (!cached) setBusy(false);
+    }
+  }
+
+  /** Silent refetch (no busy spinner) used to poll transcoding videos to ready. */
+  async function refreshForProcessing() {
+    try {
+      const albumId = activeAlbumIdRef.current;
+      if (albumId) {
+        const data = await api<{ assets: Asset[] }>(`/api/albums/${albumId}/assets`);
+        albumAssetsCache.current.set(albumId, data.assets);
+        if (activeAlbumIdRef.current === albumId) setAssets(data.assets);
+      } else {
+        const data = await api<{ assets: Asset[] }>(`/api/assets?view=${view}&q=${encodeURIComponent(search)}`);
+        if (!activeAlbumIdRef.current) setAssets(data.assets);
+      }
+    } catch {
+      // Ignore transient poll failures; the next tick retries.
     }
   }
 
@@ -1145,8 +1179,37 @@ function ViewerStage({
   const zoom = useRef({ scale: 1, tx: 0, ty: 0 });
   const lastTap = useRef<{ time: number; x: number; y: number } | null>(null);
   const justSwiped = useRef(false);
+  // Video playback: native <video> handles its own gestures, so the swipe/zoom
+  // logic below is skipped when the current asset is a playable video.
+  const isVideo = asset.mediaType === "video" && asset.status === "ready" && Boolean(asset.urls.video);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [quality, setQuality] = useState<"hd" | "sd">("hd");
+  const resume = useRef<{ time: number; playing: boolean } | null>(null);
+  const videoSrc = quality === "sd" && asset.urls.videoSd ? asset.urls.videoSd : asset.urls.video;
   useBodyScrollLock();
   useBackClose(true, onClose);
+
+  useEffect(() => {
+    setQuality("hd");
+    resume.current = null;
+  }, [asset.id]);
+
+  function toggleQuality() {
+    const v = videoRef.current;
+    if (v) resume.current = { time: v.currentTime, playing: !v.paused };
+    setQuality((q) => (q === "hd" ? "sd" : "hd"));
+  }
+
+  // The <video> remounts on quality change (key includes quality), so restore
+  // the playhead and play state once the new rendition's metadata is ready.
+  function handleVideoMeta() {
+    const v = videoRef.current;
+    if (v && resume.current) {
+      v.currentTime = resume.current.time;
+      if (resume.current.playing) void v.play();
+      resume.current = null;
+    }
+  }
 
   useEffect(() => {
     zoom.current = { scale: 1, tx: 0, ty: 0 };
@@ -1225,6 +1288,8 @@ function ViewerStage({
   }
 
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    // Native video controls own all pointer interaction for videos.
+    if (isVideo) return;
     // Pointer capture would redirect the eventual click away from toolbar
     // buttons, so gestures rely on bubbling instead — and never start on one.
     if ((event.target as HTMLElement).closest("button")) return;
@@ -1335,7 +1400,7 @@ function ViewerStage({
     <Overlay>
       <div aria-modal="true" className={infoOpen ? "viewer info-open" : "viewer"} role="dialog">
         <div
-          className="viewer-stage"
+          className={isVideo ? "viewer-stage is-video" : "viewer-stage"}
           onClick={(event) => {
             if (justSwiped.current) {
               justSwiped.current = false;
@@ -1351,26 +1416,50 @@ function ViewerStage({
         >
           <div className="viewer-topbar">
             <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
-            <div className="viewer-actions">{actions}</div>
+            <div className="viewer-actions">
+              {isVideo && asset.urls.videoSd && (
+                <button className="icon-button light viewer-quality" onClick={toggleQuality} type="button" title="Toggle quality">
+                  {quality === "hd" ? "HD" : "SD"}
+                </button>
+              )}
+              {actions}
+            </div>
           </div>
           {previous && (
             <button className="viewer-nav previous" onClick={() => onSelect(previous)} title="Previous" type="button">
               <ChevronLeft size={28} />
             </button>
           )}
-          {!loaded && (
-            <img alt="" aria-hidden className="viewer-backdrop" draggable={false} key={`backdrop-${asset.id}`} src={asset.urls.thumb} />
+          {isVideo ? (
+            <video
+              autoPlay
+              className="viewer-video"
+              controls
+              key={`${asset.id}-${quality}`}
+              onLoadedMetadata={handleVideoMeta}
+              playsInline
+              poster={asset.urls.preview}
+              preload="metadata"
+              ref={videoRef}
+              src={videoSrc ?? undefined}
+            />
+          ) : (
+            <>
+              {!loaded && (
+                <img alt="" aria-hidden className="viewer-backdrop" draggable={false} key={`backdrop-${asset.id}`} src={asset.urls.thumb} />
+              )}
+              <img
+                alt={asset.originalName}
+                className={loaded ? "viewer-image" : "viewer-image loading"}
+                draggable={false}
+                key={asset.id}
+                onDoubleClick={(event) => toggleZoom(event.clientX, event.clientY)}
+                onLoad={() => setLoadedId(asset.id)}
+                ref={imgRef}
+                src={asset.urls.preview}
+              />
+            </>
           )}
-          <img
-            alt={asset.originalName}
-            className={loaded ? "viewer-image" : "viewer-image loading"}
-            draggable={false}
-            key={asset.id}
-            onDoubleClick={(event) => toggleZoom(event.clientX, event.clientY)}
-            onLoad={() => setLoadedId(asset.id)}
-            ref={imgRef}
-            src={asset.urls.preview}
-          />
           {next && (
             <button className="viewer-nav next" onClick={() => onSelect(next)} title="Next" type="button">
               <ChevronRight size={28} />
@@ -1453,6 +1542,9 @@ function Viewer({
         <div><dt>Date</dt><dd>{prettyDate(asset.takenAt)}</dd></div>
         <div><dt>Size</dt><dd>{formatBytes(asset.sizeBytes)}</dd></div>
         <div><dt>Dimensions</dt><dd>{asset.width && asset.height ? `${asset.width} x ${asset.height}` : "Unknown"}</dd></div>
+        {asset.mediaType === "video" && asset.durationMs ? (
+          <div><dt>Duration</dt><dd>{formatDuration(asset.durationMs)}</dd></div>
+        ) : null}
         <div><dt>Type</dt><dd>{asset.mimeType}</dd></div>
       </dl>
       <div className="info-actions">
@@ -1612,6 +1704,7 @@ function LibraryView({
                     type="button"
                   >
                     <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" draggable={false} />
+                    <VideoTileOverlay asset={asset} />
                     {selectMode
                       ? <span className={`tile-checkbox${isSelected ? " checked" : ""}`} />
                       : <>
@@ -1870,6 +1963,7 @@ function AddExistingModal({
                             type="button"
                           >
                             <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" />
+                            <VideoTileOverlay asset={asset} />
                             <span className={checked ? "tile-checkbox checked" : "tile-checkbox"} />
                           </button>
                         );
@@ -2180,6 +2274,32 @@ function groupAssets(assets: Asset[]) {
 
 function prettyDate(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
+}
+
+function formatDuration(ms: number) {
+  const total = Math.round(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h ? String(m).padStart(2, "0") : String(m);
+  return `${h ? `${h}:` : ""}${mm}:${String(s).padStart(2, "0")}`;
+}
+
+/** Play icon / processing / failed overlay drawn over a video tile's thumbnail. */
+function VideoTileOverlay({ asset }: { asset: Asset }) {
+  if (asset.mediaType !== "video") return null;
+  if (asset.status === "processing") {
+    return <span className="tile-video processing"><Loader size={16} className="spin" /></span>;
+  }
+  if (asset.status === "failed") {
+    return <span className="tile-video failed" title="Processing failed"><AlertTriangle size={16} /></span>;
+  }
+  return (
+    <span className="tile-video">
+      <Play size={18} fill="currentColor" />
+      {asset.durationMs ? <span className="tile-duration">{formatDuration(asset.durationMs)}</span> : null}
+    </span>
+  );
 }
 
 function formatBytes(bytes: number) {

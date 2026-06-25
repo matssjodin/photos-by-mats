@@ -4,13 +4,19 @@ import express from "express";
 import multer from "multer";
 import { DatabaseSync } from "node:sqlite";
 import crypto from "node:crypto";
-import { createReadStream } from "node:fs";
+import { spawn } from "node:child_process";
+import { createReadStream, existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
+import ffmpegStatic from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
 import exifrPkg from "exifr";
 const parseExif = exifrPkg.parse.bind(exifrPkg);
 import { fileURLToPath } from "node:url";
+
+const ffmpegPath = ffmpegStatic as unknown as string;
+const ffprobePath = ffprobeStatic.path;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -24,9 +30,11 @@ const sessionCookie = "sjodin_session";
 const sessionTtlMs = 1000 * 60 * 60 * 24 * 30;
 const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES ?? 500);
 const maxUploadFileSizeMb = Number(process.env.MAX_UPLOAD_FILE_SIZE_MB ?? 120);
+const maxUploadVideoSizeMb = Number(process.env.MAX_UPLOAD_VIDEO_SIZE_MB ?? 2048);
 const isProduction = process.env.NODE_ENV === "production";
 const appOrigin = process.env.APP_ORIGIN?.replace(/\/$/, "");
 const ingestConcurrency = Math.max(1, Number(process.env.INGEST_CONCURRENCY ?? 3));
+const videoConcurrency = Math.max(1, Number(process.env.VIDEO_CONCURRENCY ?? 1));
 const trashRetentionDays = Number(process.env.TRASH_RETENTION_DAYS ?? 30);
 // White-label branding: shown in the UI, the page title, and the PWA manifest.
 const appName = (process.env.APP_NAME ?? "").trim() || "Sjodin Photos";
@@ -74,6 +82,11 @@ type AssetRow = {
   preview_path: string;
   thumb_path: string;
   content_hash: string | null;
+  media_type: string;
+  status: string;
+  duration_ms: number | null;
+  video_path: string | null;
+  video_sd_path: string | null;
 };
 
 type AlbumRow = {
@@ -102,15 +115,17 @@ app.set("trust proxy", 1);
 const upload = multer({
   dest: tempDir,
   limits: {
-    fileSize: 1024 * 1024 * maxUploadFileSizeMb,
+    // multer enforces a single per-file size cap, so use the larger (video)
+    // limit here; the image-specific cap is enforced in ingestAsset().
+    fileSize: 1024 * 1024 * Math.max(maxUploadFileSizeMb, maxUploadVideoSizeMb),
     files: maxUploadFiles
   },
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype.startsWith("image/")) {
+    if (file.mimetype.startsWith("image/") || file.mimetype.startsWith("video/")) {
       cb(null, true);
       return;
     }
-    cb(new Error("Only image files can be uploaded."));
+    cb(new Error("Only image and video files can be uploaded."));
   }
 });
 
@@ -185,6 +200,11 @@ ensureColumn("albums", "cover_asset_id", "TEXT");
 ensureColumn("assets", "content_hash", "TEXT");
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_user_hash ON assets(user_id, content_hash) WHERE content_hash IS NOT NULL");
 ensureColumn("assets", "trashed_at", "TEXT");
+ensureColumn("assets", "media_type", "TEXT NOT NULL DEFAULT 'image'");
+ensureColumn("assets", "status", "TEXT NOT NULL DEFAULT 'ready'");
+ensureColumn("assets", "duration_ms", "INTEGER");
+ensureColumn("assets", "video_path", "TEXT");
+ensureColumn("assets", "video_sd_path", "TEXT");
 // Photos trashed before this column existed start their retention clock now.
 db.prepare("UPDATE assets SET trashed_at = ? WHERE trashed = 1 AND trashed_at IS NULL").run(new Date().toISOString());
 db.exec(`
@@ -234,7 +254,7 @@ app.get("/api/share/:token/file/:assetId/:variant", (req, res) => {
   const assetId = String(req.params.assetId);
   const variant = String(req.params.variant);
   const album = db.prepare("SELECT * FROM albums WHERE share_token = ?").get(token) as AlbumRow | undefined;
-  if (!album || (variant !== "thumb" && variant !== "preview")) {
+  if (!album || !["thumb", "preview", "video", "video_sd"].includes(variant)) {
     res.status(404).json({ error: "Shared asset not found." });
     return;
   }
@@ -249,7 +269,16 @@ app.get("/api/share/:token/file/:assetId/:variant", (req, res) => {
     return;
   }
 
-  sendAssetFile(res, variant === "thumb" ? asset.thumb_path : asset.preview_path);
+  let relPath = "";
+  if (variant === "thumb") relPath = asset.thumb_path;
+  else if (variant === "preview") relPath = asset.preview_path;
+  else if (variant === "video") relPath = (asset.status === "ready" && asset.video_path) || "";
+  else if (variant === "video_sd") relPath = (asset.status === "ready" && asset.video_sd_path) || "";
+  if (!relPath) {
+    res.status(404).json({ error: "Shared asset not found." });
+    return;
+  }
+  sendAssetFile(res, relPath);
 });
 
 app.post("/api/auth/login", (req, res) => {
@@ -487,20 +516,23 @@ app.get("/api/assets/:id/file/:variant", (req, res) => {
   }
 
   const variant = req.params.variant;
-  // "original" now serves the stored 2048px WebP as a download — the
-  // uploaded source file is discarded at ingest.
-  const relPath = variant === "original" || variant === "preview"
-    ? asset.preview_path
-    : variant === "thumb"
-      ? asset.thumb_path
-      : "";
+  const isVideo = asset.media_type === "video";
+  // For images, "original" serves the stored 2048px WebP (the uploaded source
+  // is discarded at ingest). For videos it serves the 1080p MP4.
+  let relPath = "";
+  if (variant === "thumb") relPath = asset.thumb_path;
+  else if (variant === "preview") relPath = asset.preview_path;
+  else if (variant === "video") relPath = (isVideo && asset.status === "ready" && asset.video_path) || "";
+  else if (variant === "video_sd") relPath = (isVideo && asset.status === "ready" && asset.video_sd_path) || "";
+  else if (variant === "original") relPath = isVideo ? (asset.status === "ready" && asset.video_path) || "" : asset.preview_path;
 
   if (!relPath) {
     res.status(404).json({ error: "Variant not found." });
     return;
   }
   if (variant === "original") {
-    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(webpDownloadName(asset.original_name))}"`);
+    const name = isVideo ? videoDownloadName(asset.original_name) : webpDownloadName(asset.original_name);
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(name)}"`);
   }
   sendAssetFile(res, relPath);
 });
@@ -582,13 +614,14 @@ app.post("/api/assets/zip", (req, res) => {
 
   const usedNames = new Set<string>();
   for (const asset of assets) {
-    let name = webpDownloadName(asset.original_name);
+    const isReadyVideo = asset.media_type === "video" && asset.status === "ready" && asset.video_path;
+    let name = isReadyVideo ? videoDownloadName(asset.original_name) : webpDownloadName(asset.original_name);
     if (usedNames.has(name)) {
       const ext = path.extname(name);
       name = `${name.slice(0, name.length - ext.length)}-${asset.id.slice(0, 8)}${ext}`;
     }
     usedNames.add(name);
-    archive.file(path.join(dataDir, asset.preview_path), { name });
+    archive.file(path.join(dataDir, isReadyVideo ? asset.video_path! : asset.preview_path), { name });
   }
   void archive.finalize();
 });
@@ -857,7 +890,7 @@ app.get("/manifest.webmanifest", (_req, res) => {
       action: "/share-target",
       method: "POST",
       enctype: "multipart/form-data",
-      params: { files: [{ name: "photos", accept: ["image/*"] }] }
+      params: { files: [{ name: "photos", accept: ["image/*", "video/*"] }] }
     }
   });
 });
@@ -881,7 +914,10 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
     res.status(400).json({ error: error.message });
     return;
   }
-  if (error instanceof Error && error.message === "Only image files can be uploaded.") {
+  if (error instanceof Error && (
+    error.message === "Only image and video files can be uploaded." ||
+    error.message.endsWith("MB limit.")
+  )) {
     res.status(400).json({ error: error.message });
     return;
   }
@@ -894,6 +930,7 @@ const server = app.listen(port, () => {
     .catch((error) => console.error("Hash backfill failed:", error))
     .then(() => migrateOriginalsToWebp())
     .catch((error) => console.error("WebP migration failed:", error));
+  resumeVideoProcessing();
 });
 // Node's 5s default races with the reverse proxies in front (Cloudflare and
 // Coolify's proxy reuse idle origin connections): a request sent just as Node
@@ -1185,8 +1222,15 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
   const id = crypto.randomUUID();
   const relativeDir = path.join("uploads", userId, id);
   const absoluteDir = path.join(dataDir, relativeDir);
+  const isVideo = file.mimetype.startsWith("video/");
 
   try {
+    // multer allows the larger video size cap for every file, so enforce the
+    // image-specific limit here.
+    if (!isVideo && file.size > 1024 * 1024 * maxUploadFileSizeMb) {
+      throw new Error(`Image exceeds the ${maxUploadFileSizeMb} MB limit.`);
+    }
+
     // The uploaded original is discarded after processing: only the 2048px
     // WebP and the thumbnail are kept. The dedupe hash is still computed
     // from the uploaded bytes so re-uploads of the same source file match.
@@ -1200,6 +1244,11 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
     }
 
     await fs.mkdir(absoluteDir, { recursive: true });
+
+    if (isVideo) {
+      return await ingestVideo(userId, id, file, relativeDir, absoluteDir, contentHash);
+    }
+
     const previewPath = path.join(relativeDir, "preview.webp");
     const thumbPath = path.join(relativeDir, "thumb.webp");
 
@@ -1269,6 +1318,249 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
   }
 }
 
+// The uploaded video is staged under the asset dir as this fixed name so the
+// background transcode (and restart recovery) can find it without a DB column.
+const VIDEO_SOURCE_NAME = "source.bin";
+
+/**
+ * Fast, synchronous half of video ingest: probe the source, extract a poster
+ * frame (so the existing <img> grid/backdrop works), stage the source for
+ * transcoding, insert a `processing` row, and enqueue the heavy transcode.
+ */
+async function ingestVideo(
+  userId: string,
+  id: string,
+  file: Express.Multer.File,
+  relativeDir: string,
+  absoluteDir: string,
+  contentHash: string
+): Promise<{ asset: ReturnType<typeof toPublicAsset>; duplicate: boolean }> {
+  const probe = await probeVideo(file.path);
+
+  const previewPath = path.join(relativeDir, "preview.webp");
+  const thumbPath = path.join(relativeDir, "thumb.webp");
+  const posterPng = path.join(absoluteDir, "poster.png");
+
+  // Grab a frame a second in (or the very start for short clips). ffmpeg
+  // auto-applies rotation metadata, so the poster is already display-oriented.
+  const seek = probe.durationMs > 2000 ? 1 : 0;
+  await runFfmpeg(["-y", "-ss", String(seek), "-i", file.path, "-frames:v", "1", "-an", posterPng]);
+
+  const previewInfo = await sharp(posterPng)
+    .resize({ width: 2048, height: 2048, fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 82 })
+    .toFile(path.join(dataDir, previewPath));
+  await sharp(posterPng)
+    .resize({ width: 560, height: 560, fit: "cover", position: "attention" })
+    .webp({ quality: 76 })
+    .toFile(path.join(dataDir, thumbPath));
+  await fs.rm(posterPng, { force: true }).catch(() => undefined);
+
+  // Stage the source inside the asset dir for the background transcode.
+  await fs.rename(file.path, path.join(absoluteDir, VIDEO_SOURCE_NAME)).catch(async () => {
+    await fs.copyFile(file.path, path.join(absoluteDir, VIDEO_SOURCE_NAME));
+    await fs.rm(file.path, { force: true }).catch(() => undefined);
+  });
+
+  const now = new Date().toISOString();
+  const takenAt = probe.createdAt ?? now;
+  const videoPath = path.join(relativeDir, "video_1080.mp4");
+  const videoSdPath = path.join(relativeDir, "video_480.mp4");
+
+  try {
+    db.prepare(`
+      INSERT INTO assets (
+        id, user_id, original_name, mime_type, size_bytes, width, height,
+        taken_at, created_at, original_path, preview_path, thumb_path, content_hash,
+        media_type, status, duration_ms, video_path, video_sd_path
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'video', 'processing', ?, ?, ?)
+    `).run(
+      id,
+      userId,
+      file.originalname,
+      "video/mp4",
+      previewInfo.size,
+      previewInfo.width ?? null,
+      previewInfo.height ?? null,
+      takenAt,
+      now,
+      // original_path mirrors preview_path so the `<>` migration guard skips it
+      // and deleteAssetCompletely() still wipes the whole asset dir.
+      previewPath,
+      previewPath,
+      thumbPath,
+      contentHash,
+      probe.durationMs || null,
+      videoPath,
+      videoSdPath
+    );
+  } catch (error) {
+    const winner = db
+      .prepare("SELECT * FROM assets WHERE user_id = ? AND content_hash = ?")
+      .get(userId, contentHash) as AssetRow | undefined;
+    if (!winner) throw error;
+    await fs.rm(absoluteDir, { recursive: true, force: true }).catch(() => undefined);
+    return { asset: toPublicAsset(restoreIfTrashed(winner)), duplicate: true };
+  }
+
+  enqueueTranscode(id);
+  const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow;
+  return { asset: toPublicAsset(row), duplicate: false };
+}
+
+// ---- Background video transcode queue ----------------------------------
+
+const transcodeQueue: string[] = [];
+const transcodeQueued = new Set<string>();
+let activeTranscodes = 0;
+
+function enqueueTranscode(assetId: string) {
+  if (transcodeQueued.has(assetId)) return;
+  transcodeQueued.add(assetId);
+  transcodeQueue.push(assetId);
+  pumpTranscodeQueue();
+}
+
+function pumpTranscodeQueue() {
+  while (activeTranscodes < videoConcurrency && transcodeQueue.length) {
+    const assetId = transcodeQueue.shift()!;
+    transcodeQueued.delete(assetId);
+    activeTranscodes += 1;
+    void transcodeAsset(assetId)
+      .catch((error) => console.error(`Transcode failed for ${assetId}:`, error))
+      .finally(() => {
+        activeTranscodes -= 1;
+        pumpTranscodeQueue();
+      });
+  }
+}
+
+async function transcodeAsset(assetId: string) {
+  const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(assetId) as AssetRow | undefined;
+  if (!row || row.media_type !== "video" || !row.video_path || !row.video_sd_path) return;
+
+  const sourcePath = path.join(path.dirname(path.join(dataDir, row.video_path)), VIDEO_SOURCE_NAME);
+  if (!(await fileExists(sourcePath))) {
+    db.prepare("UPDATE assets SET status = 'failed' WHERE id = ?").run(assetId);
+    return;
+  }
+
+  try {
+    const portrait = (row.height ?? 0) > (row.width ?? 0);
+    await runFfmpeg(transcodeArgs(sourcePath, path.join(dataDir, row.video_path), portrait ? 1080 : 1920, portrait ? 1920 : 1080, 23, "128k"));
+    await runFfmpeg(transcodeArgs(sourcePath, path.join(dataDir, row.video_sd_path), portrait ? 480 : 854, portrait ? 854 : 480, 26, "96k"));
+
+    const stat = await fs.stat(path.join(dataDir, row.video_path)).catch(() => null);
+    db.prepare("UPDATE assets SET status = 'ready', size_bytes = ? WHERE id = ?")
+      .run(stat?.size ?? row.size_bytes, assetId);
+    await fs.rm(sourcePath, { force: true }).catch(() => undefined);
+  } catch (error) {
+    db.prepare("UPDATE assets SET status = 'failed' WHERE id = ?").run(assetId);
+    throw error;
+  }
+}
+
+/** Build ffmpeg args for one H.264/AAC faststart MP4 that fits within boxW×boxH (no upscaling). */
+function transcodeArgs(source: string, out: string, boxW: number, boxH: number, crf: number, audioBitrate: string): string[] {
+  const scale = `scale=w=${boxW}:h=${boxH}:force_original_aspect_ratio=decrease:force_divisible_by=2`;
+  return [
+    "-y",
+    "-i", source,
+    "-vf", scale,
+    "-c:v", "libx264",
+    "-preset", "medium",
+    "-crf", String(crf),
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-b:a", audioBitrate,
+    "-movflags", "+faststart",
+    out
+  ];
+}
+
+/** On boot, re-enqueue videos still marked `processing`; fail any whose source is gone. */
+function resumeVideoProcessing() {
+  const rows = db.prepare("SELECT id, video_path FROM assets WHERE media_type = 'video' AND status = 'processing'")
+    .all() as Array<{ id: string; video_path: string | null }>;
+  for (const row of rows) {
+    if (!row.video_path) {
+      db.prepare("UPDATE assets SET status = 'failed' WHERE id = ?").run(row.id);
+      continue;
+    }
+    const sourcePath = path.join(path.dirname(path.join(dataDir, row.video_path)), VIDEO_SOURCE_NAME);
+    if (existsSync(sourcePath)) {
+      enqueueTranscode(row.id);
+    } else {
+      db.prepare("UPDATE assets SET status = 'failed' WHERE id = ?").run(row.id);
+    }
+  }
+  if (rows.length) console.log(`Resumed video processing for ${rows.length} asset(s).`);
+}
+
+function runFfmpeg(args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited with code ${code}: ${stderr.trim()}`));
+    });
+  });
+}
+
+function probeVideo(filePath: string): Promise<{ durationMs: number; width: number | null; height: number | null; createdAt: string | null }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffprobePath, [
+      "-v", "error",
+      "-print_format", "json",
+      "-show_format",
+      "-show_streams",
+      filePath
+    ], { stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffprobe exited with code ${code}`));
+        return;
+      }
+      try {
+        const data = JSON.parse(stdout) as {
+          format?: { duration?: string; tags?: Record<string, string> };
+          streams?: Array<{ codec_type?: string; width?: number; height?: number; tags?: Record<string, string> }>;
+        };
+        const video = data.streams?.find((s) => s.codec_type === "video");
+        const durationSec = Number(data.format?.duration ?? 0);
+        const creation = data.format?.tags?.creation_time ?? video?.tags?.creation_time;
+        const created = creation ? new Date(creation) : null;
+        resolve({
+          durationMs: Number.isFinite(durationSec) ? Math.round(durationSec * 1000) : 0,
+          width: video?.width ?? null,
+          height: video?.height ?? null,
+          createdAt: created && !isNaN(created.getTime()) ? created.toISOString() : null
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function restoreIfTrashed(asset: AssetRow): AssetRow {
   if (!asset.trashed) return asset;
   db.prepare("UPDATE assets SET trashed = 0, trashed_at = NULL WHERE id = ?").run(asset.id);
@@ -1287,7 +1579,7 @@ function sha256File(filePath: string): Promise<string> {
 
 /** One-time backfill of content hashes for assets ingested before dedupe existed. */
 async function backfillContentHashes() {
-  const rows = db.prepare("SELECT id, user_id, original_path FROM assets WHERE content_hash IS NULL").all() as
+  const rows = db.prepare("SELECT id, user_id, original_path FROM assets WHERE content_hash IS NULL AND media_type = 'image'").all() as
     Array<{ id: string; user_id: string; original_path: string }>;
   if (!rows.length) return;
   let updated = 0;
@@ -1310,7 +1602,7 @@ async function backfillContentHashes() {
  * Must run after backfillContentHashes so hashes reflect the uploaded bytes.
  */
 async function migrateOriginalsToWebp() {
-  const rows = db.prepare("SELECT * FROM assets WHERE original_path <> preview_path").all() as AssetRow[];
+  const rows = db.prepare("SELECT * FROM assets WHERE original_path <> preview_path AND media_type = 'image'").all() as AssetRow[];
   if (!rows.length) return;
   console.log(`Migrating ${rows.length} asset(s) to WebP-only storage...`);
   let migrated = 0;
@@ -1358,6 +1650,12 @@ function webpDownloadName(originalName: string) {
   return `${base || "photo"}.webp`;
 }
 
+function videoDownloadName(originalName: string) {
+  const ext = path.extname(originalName);
+  const base = ext ? originalName.slice(0, originalName.length - ext.length) : originalName;
+  return `${base || "video"}.mp4`;
+}
+
 function sendAssetFile(res: express.Response, relPath: string) {
   // Variant files never change for a given asset id, so they can be cached hard.
   res.sendFile(
@@ -1400,6 +1698,8 @@ function toPublicAlbum(row: AlbumRow) {
 
 function toPublicAsset(row: AssetRow, shareToken?: string) {
   const base = shareToken ? `/api/share/${shareToken}/file/${row.id}` : `/api/assets/${row.id}/file`;
+  const isVideo = row.media_type === "video";
+  const ready = isVideo && row.status === "ready";
   return {
     id: row.id,
     originalName: row.original_name,
@@ -1412,10 +1712,15 @@ function toPublicAsset(row: AssetRow, shareToken?: string) {
     favorite: Boolean(row.favorite),
     archived: Boolean(row.archived),
     trashed: Boolean(row.trashed),
+    mediaType: isVideo ? "video" : "image",
+    status: row.status ?? "ready",
+    durationMs: row.duration_ms ?? null,
     urls: {
       thumb: `${base}/thumb`,
       preview: `${base}/preview`,
-      original: shareToken ? null : `${base}/original`
+      original: shareToken ? null : `${base}/original`,
+      video: ready ? `${base}/video` : null,
+      videoSd: ready ? `${base}/video_sd` : null
     }
   };
 }

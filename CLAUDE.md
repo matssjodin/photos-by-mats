@@ -57,13 +57,15 @@ In production, the Express server serves `dist-client/` as static files and catc
 
 **Data layer:**
 - SQLite database at `DATA_DIR/photos.sqlite` (default `./data/photos.sqlite`)
-- Each asset is stored as exactly two WebP files under `DATA_DIR/uploads/<userId>/<assetId>/`: `preview.webp` (max 2048px on the longer side) and `thumb.webp` (560px). The uploaded original is **discarded after ingest** — the dedupe hash is computed from the uploaded bytes before conversion, so re-uploading the same source file still registers as a duplicate. The `original` download variant and the zip endpoint serve the 2048px WebP with the original filename's extension swapped to `.webp`. (`assets.original_path` is kept equal to `preview_path` for schema compatibility; `migrateOriginalsToWebp()` converts pre-existing assets on startup and deletes their stored originals.)
+- Each **image** asset is stored as exactly two WebP files under `DATA_DIR/uploads/<userId>/<assetId>/`: `preview.webp` (max 2048px on the longer side) and `thumb.webp` (560px). The uploaded original is **discarded after ingest** — the dedupe hash is computed from the uploaded bytes before conversion, so re-uploading the same source file still registers as a duplicate. The `original` download variant and the zip endpoint serve the 2048px WebP with the original filename's extension swapped to `.webp`. (`assets.original_path` is kept equal to `preview_path` for schema compatibility; `migrateOriginalsToWebp()` converts pre-existing assets on startup and deletes their stored originals.)
 - `sharp` handles image processing and EXIF auto-rotation on ingest
 - `multer` handles multipart uploads, staging files in `DATA_DIR/tmp/` until `ingestAsset()` has converted them
 
+**Video support:** Uploads accept `video/*` in addition to images. `ingestAsset()` branches to `ingestVideo()`, which (synchronously, so the upload returns fast) probes the file with `ffprobe`, extracts a poster frame with `ffmpeg` → the same `preview.webp`/`thumb.webp` poster pair as images (so the existing `<img>` grid/viewer-backdrop work), stages the source as `source.bin` in the asset dir, and inserts a row with `media_type='video'`, `status='processing'`. A background in-process queue (`enqueueTranscode`/`transcodeAsset`, concurrency `VIDEO_CONCURRENCY`) then transcodes two faststart H.264/AAC MP4s — `video_1080.mp4` (≤1080p) and `video_480.mp4` (≤480p) — flips the row to `status='ready'`, and deletes the source (originals are **not** kept). `resumeVideoProcessing()` re-enqueues interrupted jobs on startup (or marks them `failed` if the source is gone). Video variant endpoints (`video`, `video_sd`, and `original`→1080p `.mp4`) reuse `sendAssetFile`, whose `res.sendFile` already serves HTTP Range requests for seeking; shared albums expose `video`/`video_sd` but not `original`. ffmpeg/ffprobe binaries come from the `ffmpeg-static`/`ffprobe-static` npm packages (no system install). New asset columns: `media_type`, `status`, `duration_ms`, `video_path`, `video_sd_path`. The client shows a play-icon + duration overlay on video tiles (a "Processing…" / error badge while transcoding), plays videos in the viewer with a `<video>` element + an HD/SD quality toggle (swipe/zoom gestures are disabled for videos), and polls the library every 5s while any asset is `processing`.
+
 **Auth:** Cookie-based sessions (`sjodin_session`). Passwords hashed with PBKDF2-SHA256 (310,000 iterations). Sessions stored in SQLite. Two roles: `admin` and `user`. The `requireAuth` middleware attaches the user to the request; `requireAdmin` gates admin routes.
 
-**Shared albums:** Albums can have an optional `share_token`; the `/share/:token` routes serve album contents without authentication. File variants served via `/api/share/:token/file/:assetId/:variant` (thumb/preview only — no original for public access).
+**Shared albums:** Albums can have an optional `share_token`; the `/share/:token` routes serve album contents without authentication. File variants served via `/api/share/:token/file/:assetId/:variant` (thumb/preview and, for videos, `video`/`video_sd` — no original for public access).
 
 ## Environment Variables
 
@@ -74,8 +76,10 @@ In production, the Express server serves `dist-client/` as static files and catc
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | — | Upserts an admin on startup if both are set |
 | `APP_ORIGIN` | — | Public origin accepted by the CSRF guard (set to the URL the browser hits) |
 | `MAX_UPLOAD_FILES` | `500` | Max files per upload request |
-| `MAX_UPLOAD_FILE_SIZE_MB` | `120` | Max file size per upload |
+| `MAX_UPLOAD_FILE_SIZE_MB` | `120` | Max file size per image upload |
+| `MAX_UPLOAD_VIDEO_SIZE_MB` | `2048` | Max file size per video upload |
 | `INGEST_CONCURRENCY` | `3` | Parallel sharp workers during upload ingest |
+| `VIDEO_CONCURRENCY` | `1` | Parallel ffmpeg transcodes in the background queue |
 | `TRASH_RETENTION_DAYS` | `30` | Days before trashed photos are permanently purged (0 disables) |
 | `APP_NAME` | `Sjodin Photos` | White-label display name (UI, page title, PWA manifest via `GET /api/config` and the dynamic `/manifest.webmanifest` route) |
 | `APP_SHORT_NAME` | `Photos` | PWA home-screen label |

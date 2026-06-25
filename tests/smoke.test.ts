@@ -1,10 +1,14 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import sharp from "sharp";
+import ffmpegStatic from "ffmpeg-static";
+
+const ffmpegBin = ffmpegStatic as unknown as string;
 
 const port = 40000 + (process.pid % 10000);
 const baseUrl = `http://127.0.0.1:${port}`;
@@ -61,6 +65,25 @@ async function makePng(background = { r: 200, g: 100, b: 50 }) {
   return sharp({
     create: { width: 64, height: 48, channels: 3, background }
   }).png().toBuffer();
+}
+
+/** Synthesize a tiny H.264 MP4 with the bundled ffmpeg for the video test. */
+async function makeMp4(): Promise<Buffer> {
+  const out = path.join(dataDir, `seed-${crypto.randomUUID()}.mp4`);
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(ffmpegBin, [
+      "-y",
+      "-f", "lavfi",
+      "-i", "testsrc=duration=1:size=320x240:rate=15",
+      "-pix_fmt", "yuv420p",
+      out
+    ], { stdio: "ignore" });
+    child.on("error", reject);
+    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg seed failed with code ${code}`))));
+  });
+  const buf = await fs.readFile(out);
+  await fs.rm(out, { force: true }).catch(() => undefined);
+  return buf;
 }
 
 test("health endpoint responds with security headers", async () => {
@@ -371,6 +394,62 @@ test("empty trash permanently deletes all trashed photos", async () => {
   assert.equal(remaining.length, 0);
 
   const gone = await fetch(`${baseUrl}/api/assets/${uploaded[0].id}/file/thumb`, { headers: authedHeaders() });
+  assert.equal(gone.status, 404);
+});
+
+test("video upload transcodes in the background and serves streamable renditions", async () => {
+  const mp4 = await makeMp4();
+  const form = new FormData();
+  form.append("photos", new Blob([new Uint8Array(mp4)], { type: "video/mp4" }), "clip.mp4");
+  const response = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+  assert.equal(response.status, 201);
+  const body = await response.json() as {
+    assets: Array<{ id: string; mediaType: string; status: string; urls: { video: string | null } }>;
+  };
+  assert.equal(body.assets.length, 1);
+  const video = body.assets[0];
+  assert.equal(video.mediaType, "video");
+  assert.equal(video.status, "processing");
+  assert.equal(video.urls.video, null, "renditions are not exposed until transcoding finishes");
+
+  // Poll until the background transcode flips the asset to ready.
+  type Listed = { id: string; status: string; urls: { video: string | null; videoSd: string | null; original: string | null } };
+  const deadline = Date.now() + 60000;
+  let ready: Listed | undefined;
+  for (;;) {
+    const list = await fetch(`${baseUrl}/api/assets?view=photos`, { headers: authedHeaders() });
+    const { assets } = await list.json() as { assets: Listed[] };
+    const found = assets.find((a) => a.id === video.id);
+    assert.notEqual(found?.status, "failed", "transcode must not fail");
+    if (found?.status === "ready") { ready = found; break; }
+    if (Date.now() > deadline) throw new Error("video did not finish transcoding within 60s");
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  assert.ok(ready.urls.video);
+  const full = await fetch(`${baseUrl}${ready.urls.video}`, { headers: authedHeaders() });
+  assert.equal(full.status, 200);
+  assert.equal(full.headers.get("content-type"), "video/mp4");
+
+  // A Range request must return 206 partial content so the player can seek.
+  const ranged = await fetch(`${baseUrl}${ready.urls.video}`, { headers: authedHeaders({ Range: "bytes=0-99" }) });
+  assert.equal(ranged.status, 206);
+  assert.ok(ranged.headers.get("content-range")?.startsWith("bytes 0-99/"));
+
+  assert.ok(ready.urls.videoSd);
+  const sd = await fetch(`${baseUrl}${ready.urls.videoSd}`, { headers: authedHeaders() });
+  assert.equal(sd.status, 200);
+
+  // Owner "original" download serves the 1080p MP4 with a .mp4 filename.
+  assert.ok(ready.urls.original);
+  const original = await fetch(`${baseUrl}${ready.urls.original}`, { headers: authedHeaders() });
+  assert.equal(original.status, 200);
+  assert.ok(original.headers.get("content-disposition")?.includes(".mp4"));
+
+  // Deleting wipes the whole asset directory.
+  const del = await fetch(`${baseUrl}/api/assets/${video.id}`, { method: "DELETE", headers: authedHeaders() });
+  assert.equal(del.status, 200);
+  const gone = await fetch(`${baseUrl}${ready.urls.video}`, { headers: authedHeaders() });
   assert.equal(gone.status, 404);
 });
 

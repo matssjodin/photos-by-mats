@@ -515,6 +515,52 @@ button:disabled {
   color: white;
 }
 
+/* ---------- Video tile overlay ---------- */
+
+.tile-video {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: white;
+  pointer-events: none;
+}
+
+.tile-video > svg {
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.55));
+}
+
+.tile-video.processing,
+.tile-video.failed {
+  align-content: center;
+  background: rgba(8, 20, 20, 0.4);
+}
+
+.tile-video.failed {
+  color: #ffb4a8;
+}
+
+.tile-duration {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  background: rgba(16, 42, 42, 0.78);
+  color: white;
+}
+
+.spin {
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 /* ---------- Select bar ---------- */
 
 .select-bar {
@@ -877,6 +923,11 @@ button:disabled {
   touch-action: none;
 }
 
+/* Let native video controls own touch gestures (scrubbing, tap) for videos. */
+.viewer-stage.is-video {
+  touch-action: auto;
+}
+
 .viewer-image {
   max-width: 100%;
   max-height: 100%;
@@ -899,6 +950,24 @@ button:disabled {
   filter: blur(22px) brightness(0.7);
   transform: scale(1.06);
   pointer-events: none;
+}
+
+.viewer-video {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  background: #000;
+}
+
+.viewer-quality {
+  width: auto;
+  min-width: 40px;
+  padding: 0 10px;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.04em;
 }
 
 .viewer-topbar {

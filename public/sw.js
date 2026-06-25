@@ -1,6 +1,6 @@
 /* Sjodin Photos service worker: offline app shell, immutable asset caching,
  * and the Android share-target upload bridge. API requests are never cached. */
-const CACHE = "sjodin-photos-v1";
+const CACHE = "sjodin-photos-v2";
 
 self.addEventListener("install", () => {
   self.skipWaiting();
