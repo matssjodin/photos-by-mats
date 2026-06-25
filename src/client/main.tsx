@@ -691,7 +691,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
               ref={fileInput}
               className="hidden-input"
               type="file"
-              accept="image/*"
+              accept="image/*,video/*"
               multiple
               onChange={(event) => void uploadPhotos(event.target.files)}
             />
@@ -1847,7 +1847,7 @@ function AlbumsView({
           <ImagePlus size={18} />
           <span>{files?.length ? `${files.length} selected` : "Photos"}</span>
         </label>
-        <input id={inputId} className="hidden-input" type="file" accept="image/*" multiple onChange={(event) => setFiles(event.target.files)} />
+        <input id={inputId} className="hidden-input" type="file" accept="image/*,video/*" multiple onChange={(event) => setFiles(event.target.files)} />
         <button className="primary-button" type="submit"><Plus size={18} /><span>Create</span></button>
       </form>
       <div className="album-grid">
