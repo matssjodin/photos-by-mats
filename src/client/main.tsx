@@ -54,6 +54,7 @@ type Asset = {
   favorite: boolean;
   archived: boolean;
   trashed: boolean;
+  inSharedAlbum: boolean;
   mediaType: "image" | "video";
   status: "processing" | "ready" | "failed";
   durationMs: number | null;
@@ -361,7 +362,8 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     return new Promise<void>((resolve) => {
       confirmAction({
         title: "Delete photo permanently?",
-        body: "This removes the photo and its thumbnail from disk. It cannot be undone.",
+        body: "This removes the photo and its thumbnail from disk. It cannot be undone."
+          + (asset.inSharedAlbum ? " It will also disappear from any shared album it's in." : ""),
         confirmLabel: "Delete permanently",
         danger: true,
         onConfirm: async () => {
@@ -475,6 +477,24 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     }
   }
 
+  async function unshareAlbum(album: Album) {
+    return new Promise<void>((resolve) => {
+      confirmAction({
+        title: "Stop sharing this album?",
+        body: "The public link stops working immediately. Your photos and the album itself are kept exactly as they are — nothing is deleted.",
+        confirmLabel: "Stop sharing",
+        onConfirm: async () => {
+          const data = await api<{ album: Album }>(`/api/albums/${album.id}/share`, { method: "DELETE" });
+          setAlbums((current) => current.map((item) => item.id === data.album.id ? data.album : item));
+          setActiveAlbum((current) => current?.id === data.album.id ? data.album : current);
+          setMessage("Sharing stopped");
+          resolve();
+        },
+        onCancel: () => resolve()
+      });
+    });
+  }
+
   async function setCoverPhoto(albumId: string, assetId: string) {
     const data = await api<{ album: Album }>(`/api/albums/${albumId}`, {
       method: "PATCH",
@@ -527,9 +547,11 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
   function bulkDelete() {
     const ids = [...selectedIds];
     if (!ids.length) return;
+    const anyShared = assets.some((asset) => selectedIds.has(asset.id) && asset.inSharedAlbum);
     confirmAction({
       title: `Delete ${ids.length} photo${ids.length === 1 ? "" : "s"} permanently?`,
-      body: "This removes the photos and their thumbnails from disk. It cannot be undone.",
+      body: "This removes the photos and their thumbnails from disk. It cannot be undone."
+        + (anyShared ? " Any that are in a shared album will disappear from there too." : ""),
       confirmLabel: "Delete permanently",
       danger: true,
       onConfirm: async () => {
@@ -725,6 +747,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
               onSelect={setSelected}
               onSetCover={activeAlbum ? setCoverPhoto : undefined}
               onShare={shareAlbum}
+              onUnshare={unshareAlbum}
               onStartSelect={startSelect}
               onToggleSelect={toggleSelect}
               onUpload={() => fileInput.current?.click()}
@@ -1595,6 +1618,7 @@ function LibraryView({
   onSelect,
   onSetCover,
   onShare,
+  onUnshare,
   onStartSelect = () => {},
   onToggleSelect = () => {},
   onUpload,
@@ -1610,6 +1634,7 @@ function LibraryView({
   onSelect: (asset: Asset) => void;
   onSetCover?: (albumId: string, assetId: string) => Promise<void>;
   onShare: (album: Album) => Promise<void>;
+  onUnshare?: (album: Album) => Promise<void>;
   onStartSelect?: (id: string) => void;
   onToggleSelect?: (id: string) => void;
   onUpload: () => void;
@@ -1667,7 +1692,7 @@ function LibraryView({
     return (
       <section className="empty-state">
         {activeAlbum && (
-          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUpload={onUpload} />
+          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
         )}
         <div className="empty-icon"><Images size={38} /></div>
         <h2>No photos here</h2>
@@ -1683,7 +1708,7 @@ function LibraryView({
     <>
       <section className="library">
         {activeAlbum && (
-          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUpload={onUpload} />
+          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
         )}
         {groupAssets(assets).map((group) => (
           <div className="date-group" key={group.label}>
@@ -1780,6 +1805,7 @@ function AlbumActionBar({
   onBack,
   onEdit,
   onShare,
+  onUnshare,
   onUpload
 }: {
   album: Album;
@@ -1787,6 +1813,7 @@ function AlbumActionBar({
   onBack: () => void;
   onEdit: () => void;
   onShare: (album: Album) => Promise<void>;
+  onUnshare?: (album: Album) => Promise<void>;
   onUpload: () => void;
 }) {
   return (
@@ -1807,6 +1834,12 @@ function AlbumActionBar({
           <ImagePlus size={18} />
           <span>Upload here</span>
         </button>
+        {album.shareUrl && onUnshare && (
+          <button className="secondary-button" onClick={() => void onUnshare(album)} type="button">
+            <X size={18} />
+            <span>Stop sharing</span>
+          </button>
+        )}
         <button className="primary-button" onClick={() => void onShare(album)} type="button">
           <Sparkles size={18} />
           <span>{album.shareUrl ? "Copy share link" : "Create share link"}</span>

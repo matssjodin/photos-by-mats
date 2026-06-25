@@ -475,7 +475,8 @@ app.get("/api/assets", (req, res) => {
     ORDER BY taken_at DESC, created_at DESC
   `).all(...params) as AssetRow[];
 
-  res.json({ assets: assets.map((asset) => toPublicAsset(asset)) });
+  const sharedIds = sharedAlbumAssetIds(user.id);
+  res.json({ assets: assets.map((asset) => toPublicAsset(asset, undefined, sharedIds.has(asset.id))) });
 });
 
 app.post("/api/assets", upload.array("photos", maxUploadFiles), async (req, res, next) => {
@@ -565,7 +566,7 @@ app.patch("/api/assets/:id", (req, res) => {
   );
 
   const updated = db.prepare("SELECT * FROM assets WHERE id = ?").get(asset.id) as AssetRow;
-  res.json({ asset: toPublicAsset(updated) });
+  res.json({ asset: toPublicAsset(updated, undefined, assetInSharedAlbum(user.id, asset.id)) });
 });
 
 app.delete("/api/assets/:id", async (req, res) => {
@@ -762,7 +763,8 @@ app.get("/api/albums/:id/assets", (req, res) => {
     WHERE album_assets.album_id = ? AND assets.trashed = 0
     ORDER BY assets.taken_at ASC, assets.original_name ASC
   `).all(albumId) as AssetRow[];
-  res.json({ assets: assets.map((asset) => toPublicAsset(asset)) });
+  const sharedIds = sharedAlbumAssetIds(user.id);
+  res.json({ assets: assets.map((asset) => toPublicAsset(asset, undefined, sharedIds.has(asset.id))) });
 });
 
 app.post("/api/albums/:id/assets", (req, res) => {
@@ -1696,7 +1698,29 @@ function toPublicAlbum(row: AlbumRow) {
   };
 }
 
-function toPublicAsset(row: AssetRow, shareToken?: string) {
+/** Asset ids that belong to at least one of the user's shared (token-bearing) albums. */
+function sharedAlbumAssetIds(userId: string): Set<string> {
+  const rows = db.prepare(`
+    SELECT DISTINCT album_assets.asset_id AS id
+    FROM album_assets
+    JOIN albums ON albums.id = album_assets.album_id
+    WHERE albums.user_id = ? AND albums.share_token IS NOT NULL
+  `).all(userId) as Array<{ id: string }>;
+  return new Set(rows.map((r) => r.id));
+}
+
+/** Whether a single asset is in any of the user's shared albums. */
+function assetInSharedAlbum(userId: string, assetId: string): boolean {
+  const row = db.prepare(`
+    SELECT 1 FROM album_assets
+    JOIN albums ON albums.id = album_assets.album_id
+    WHERE album_assets.asset_id = ? AND albums.user_id = ? AND albums.share_token IS NOT NULL
+    LIMIT 1
+  `).get(assetId, userId);
+  return Boolean(row);
+}
+
+function toPublicAsset(row: AssetRow, shareToken?: string, inSharedAlbum = false) {
   const base = shareToken ? `/api/share/${shareToken}/file/${row.id}` : `/api/assets/${row.id}/file`;
   const isVideo = row.media_type === "video";
   const ready = isVideo && row.status === "ready";
@@ -1712,6 +1736,7 @@ function toPublicAsset(row: AssetRow, shareToken?: string) {
     favorite: Boolean(row.favorite),
     archived: Boolean(row.archived),
     trashed: Boolean(row.trashed),
+    inSharedAlbum,
     mediaType: isVideo ? "video" : "image",
     status: row.status ?? "ready",
     durationMs: row.duration_ms ?? null,

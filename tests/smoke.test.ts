@@ -242,6 +242,47 @@ test("album create, add asset, share, and public access work end to end", async 
   assert.equal(bogus.status, 404);
 });
 
+test("inSharedAlbum tracks membership and revoking a share keeps the photos", async () => {
+  // Upload a dedicated asset and confirm it is not flagged as shared yet.
+  const png = await makePng({ r: 33, g: 99, b: 150 });
+  const form = new FormData();
+  form.append("photos", new Blob([new Uint8Array(png)], { type: "image/png" }), "shared-flag.png");
+  const upload = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+  const { assets: uploaded } = await upload.json() as { assets: Array<{ id: string; inSharedAlbum: boolean }> };
+  const id = uploaded[0].id;
+  assert.equal(uploaded[0].inSharedAlbum, false);
+
+  // Put it in an album and share that album.
+  const album = (await (await fetch(`${baseUrl}/api/albums`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ title: "Shared flag" })
+  })).json() as { album: { id: string } }).album;
+  await fetch(`${baseUrl}/api/albums/${album.id}/assets`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ assetIds: [id] })
+  });
+  await fetch(`${baseUrl}/api/albums/${album.id}/share`, { method: "POST", headers: authedHeaders() });
+
+  const listShared = await fetch(`${baseUrl}/api/assets?view=photos`, { headers: authedHeaders() });
+  const sharedAsset = (await listShared.json() as { assets: Array<{ id: string; inSharedAlbum: boolean }> })
+    .assets.find((a) => a.id === id);
+  assert.equal(sharedAsset?.inSharedAlbum, true, "asset in a shared album must be flagged");
+
+  // Revoking the share must NOT delete the asset, and clears the flag.
+  const unshare = await fetch(`${baseUrl}/api/albums/${album.id}/share`, { method: "DELETE", headers: authedHeaders() });
+  assert.equal(unshare.status, 200);
+
+  const stillThere = await fetch(`${baseUrl}/api/assets/${id}/file/thumb`, { headers: authedHeaders() });
+  assert.equal(stillThere.status, 200, "revoking a share must keep the photo");
+
+  const listAfter = await fetch(`${baseUrl}/api/assets?view=photos`, { headers: authedHeaders() });
+  const afterAsset = (await listAfter.json() as { assets: Array<{ id: string; inSharedAlbum: boolean }> })
+    .assets.find((a) => a.id === id);
+  assert.equal(afterAsset?.inSharedAlbum, false, "flag clears once the album is no longer shared");
+});
+
 test("trash and permanent delete remove the asset", async () => {
   const trashResponse = await fetch(`${baseUrl}/api/assets/${assetId}`, {
     method: "PATCH",

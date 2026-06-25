@@ -65,7 +65,7 @@ In production, the Express server serves `dist-client/` as static files and catc
 
 **Auth:** Cookie-based sessions (`sjodin_session`). Passwords hashed with PBKDF2-SHA256 (310,000 iterations). Sessions stored in SQLite. Two roles: `admin` and `user`. The `requireAuth` middleware attaches the user to the request; `requireAdmin` gates admin routes.
 
-**Shared albums:** Albums can have an optional `share_token`; the `/share/:token` routes serve album contents without authentication. File variants served via `/api/share/:token/file/:assetId/:variant` (thumb/preview and, for videos, `video`/`video_sd` — no original for public access).
+**Shared albums:** Albums can have an optional `share_token`; the `/share/:token` routes serve album contents without authentication. File variants served via `/api/share/:token/file/:assetId/:variant` (thumb/preview and, for videos, `video`/`video_sd` — no original for public access). `POST /api/albums/:id/share` mints/keeps a token; `DELETE /api/albums/:id/share` revokes it (sets `share_token = NULL`) and **never touches the album's assets** — the "Stop sharing" button surfaces this. Asset list responses include `inSharedAlbum` (computed via `sharedAlbumAssetIds`/`assetInSharedAlbum`) so the delete confirmation can warn only when the photo actually belongs to a shared album.
 
 ## Environment Variables
 
