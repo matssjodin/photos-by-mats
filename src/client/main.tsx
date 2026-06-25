@@ -361,8 +361,8 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
   async function deleteAsset(asset: Asset) {
     return new Promise<void>((resolve) => {
       confirmAction({
-        title: "Delete photo permanently?",
-        body: "This removes the photo and its thumbnail from disk. It cannot be undone."
+        title: "Delete item permanently?",
+        body: "This removes the item and its files from disk. It cannot be undone."
           + (asset.inSharedAlbum ? " It will also disappear from any shared album it's in." : ""),
         confirmLabel: "Delete permanently",
         danger: true,
@@ -415,7 +415,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     const count = assets.length;
     confirmAction({
       title: "Empty trash?",
-      body: `This permanently deletes ${count} photo${count === 1 ? "" : "s"} from disk. It cannot be undone.`,
+      body: `This permanently deletes ${count} item${count === 1 ? "" : "s"} from disk. It cannot be undone.`,
       confirmLabel: "Empty trash",
       danger: true,
       onConfirm: async () => {
@@ -446,10 +446,10 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     const album = activeAlbum;
     const count = album.assetCount;
     confirmAction({
-      title: deleteAssets ? `Delete "${album.title}" and its photos?` : `Delete "${album.title}"?`,
+      title: deleteAssets ? `Delete "${album.title}" and its items?` : `Delete "${album.title}"?`,
       body: deleteAssets
-        ? `The album is removed and its ${count} photo${count === 1 ? "" : "s"} move to the trash.`
-        : "Only the album is removed — its photos stay in your library.",
+        ? `The album is removed and its ${count} item${count === 1 ? "" : "s"} move to the trash.`
+        : "Only the album is removed — its items stay in your library.",
       confirmLabel: "Delete album",
       danger: true,
       onConfirm: async () => {
@@ -549,8 +549,8 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     if (!ids.length) return;
     const anyShared = assets.some((asset) => selectedIds.has(asset.id) && asset.inSharedAlbum);
     confirmAction({
-      title: `Delete ${ids.length} photo${ids.length === 1 ? "" : "s"} permanently?`,
-      body: "This removes the photos and their thumbnails from disk. It cannot be undone."
+      title: `Delete ${ids.length} item${ids.length === 1 ? "" : "s"} permanently?`,
+      body: "This removes the items and their files from disk. It cannot be undone."
         + (anyShared ? " Any that are in a shared album will disappear from there too." : ""),
       confirmLabel: "Delete permanently",
       danger: true,
@@ -2074,7 +2074,7 @@ function EditAlbumModal({
                   type="checkbox"
                 />
                 <span>
-                  Also move the album&apos;s {album.assetCount} photo{album.assetCount === 1 ? "" : "s"} to the trash
+                  Also move the album&apos;s {album.assetCount} item{album.assetCount === 1 ? "" : "s"} to the trash
                 </span>
               </label>
               <button className="danger-button" onClick={() => onDelete(deleteAssets)} type="button">
