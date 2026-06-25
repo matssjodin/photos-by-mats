@@ -225,7 +225,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.get("/api/config", (_req, res) => {
-  res.json({ appName, appShortName, attributionText, attributionUrl });
+  res.json({ appName, appShortName, attributionText, attributionUrl, maxUploadFileSizeMb, maxUploadVideoSizeMb });
 });
 
 app.get("/api/share/:token", (req, res) => {

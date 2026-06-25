@@ -96,13 +96,17 @@ type AppConfig = {
   appShortName: string;
   attributionText: string;
   attributionUrl: string;
+  maxUploadFileSizeMb: number;
+  maxUploadVideoSizeMb: number;
 };
 
 const fallbackConfig: AppConfig = {
   appName: "Sjodin Photos",
   appShortName: "Photos",
   attributionText: "",
-  attributionUrl: ""
+  attributionUrl: "",
+  maxUploadFileSizeMb: 120,
+  maxUploadVideoSizeMb: 2048
 };
 
 function App() {
@@ -139,10 +143,24 @@ function App() {
     return <SharedAlbum appName={appName} attribution={config ?? fallbackConfig} token={shareToken} />;
   }
   if (!user) return <Login appName={appName} onLogin={setUser} />;
-  return <PhotosApp appName={appName} user={user} onLogout={() => setUser(null)} />;
+  return (
+    <PhotosApp
+      appName={appName}
+      user={user}
+      onLogout={() => setUser(null)}
+      maxImageMb={config?.maxUploadFileSizeMb ?? fallbackConfig.maxUploadFileSizeMb}
+      maxVideoMb={config?.maxUploadVideoSizeMb ?? fallbackConfig.maxUploadVideoSizeMb}
+    />
+  );
 }
 
-function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; onLogout: () => void }) {
+function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
+  appName: string;
+  user: User;
+  onLogout: () => void;
+  maxImageMb: number;
+  maxVideoMb: number;
+}) {
   const [view, setView] = useState<View>("photos");
   const [assets, setAssets] = useState<Asset[]>([]);
   const [albums, setAlbums] = useState<Album[]>([]);
@@ -182,7 +200,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
     // Landing back from the share-target service worker flow.
     const params = new URLSearchParams(window.location.search);
     if (params.has("shared")) {
-      setMessage(params.get("shared") === "1" ? "Shared photos added to your library" : "Could not add the shared photos");
+      setMessage(params.get("shared") === "1" ? "Shared items added to your library" : "Could not add the shared items");
       window.history.replaceState(null, "", "/");
     }
   }, []);
@@ -289,7 +307,25 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
 
   async function uploadPhotos(files: FileList | File[] | null, albumId = activeAlbum?.id) {
     if (!files?.length) return;
-    const list = Array.from(files);
+    // Reject oversized files before any upload starts: images and videos have
+    // separate server-side caps, so check each file against its own limit.
+    const maxImageBytes = maxImageMb * 1024 * 1024;
+    const maxVideoBytes = maxVideoMb * 1024 * 1024;
+    const tooBig: string[] = [];
+    const list = Array.from(files).filter((file) => {
+      const limit = file.type.startsWith("video/") ? maxVideoBytes : maxImageBytes;
+      if (file.size > limit) {
+        tooBig.push(file.name);
+        return false;
+      }
+      return true;
+    });
+    if (!list.length) {
+      setMessage(tooBig.length
+        ? `Too large to upload — images must be under ${formatMb(maxImageMb)}, videos under ${formatMb(maxVideoMb)}.`
+        : "Nothing to upload.");
+      return;
+    }
     const batches = batchForUpload(list);
     const totalBytes = list.reduce((sum, file) => sum + file.size, 0) || 1;
     const endpoint = albumId ? `/api/albums/${albumId}/upload` : "/api/assets";
@@ -312,14 +348,15 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
         skipped += result.duplicates?.length ?? 0;
         failed += result.errors.length;
       }
-      const parts = [`Added ${added} photo${added === 1 ? "" : "s"}`];
+      const parts = [`Added ${added} item${added === 1 ? "" : "s"}`];
       if (skipped) parts.push(`skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}`);
+      if (tooBig.length) parts.push(`${tooBig.length} too large`);
       if (failed) parts.push(`${failed} failed`);
       setMessage(parts.join(", "));
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Upload failed.";
       const done = added + skipped;
-      setMessage(done ? `Uploaded ${done} of ${list.length} photos, then failed: ${reason}` : reason);
+      setMessage(done ? `Uploaded ${done} of ${list.length} items, then failed: ${reason}` : reason);
     } finally {
       // Refresh even after a mid-batch failure so already-uploaded photos show up.
       if (added || skipped) {
@@ -459,7 +496,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
         setActiveAlbum(null);
         setAlbums((current) => current.filter((item) => item.id !== album.id));
         await loadAlbums();
-        setMessage(deleteAssets ? "Album deleted, photos moved to trash" : "Album deleted");
+        setMessage(deleteAssets ? "Album deleted, items moved to trash" : "Album deleted");
       }
     });
   }
@@ -625,6 +662,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
 
   const title = activeAlbum ? activeAlbum.title : view === "photos" ? "Photos" : labelFor(view);
   const showLibraryTools = view !== "admin" && !(view === "albums" && !activeAlbum);
+  const uploadHint = `Up to ${formatMb(maxImageMb)} per image · ${formatMb(maxVideoMb)} per video`;
 
   return (
     <div className="app-shell">
@@ -704,7 +742,7 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
               </button>
             )}
             {showLibraryTools && (
-              <button className="primary-button" onClick={() => fileInput.current?.click()} type="button">
+              <button className="primary-button" onClick={() => fileInput.current?.click()} title={uploadHint} type="button">
                 <ImagePlus size={18} />
                 <span>Upload</span>
               </button>
@@ -736,8 +774,9 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
         ) : view === "albums" && !activeAlbum ? (
           <AlbumsView albums={albums} onCreate={createAlbum} onOpen={setActiveAlbum} onShare={shareAlbum} />
         ) : (
-          <DropArea dragging={dragging} onDragChange={setDragging} onDrop={handleDrop}>
+          <DropArea dragging={dragging} hint={uploadHint} onDragChange={setDragging} onDrop={handleDrop}>
             <LibraryView
+              uploadHint={uploadHint}
               activeAlbum={activeAlbum}
               assets={visibleAssets}
               busy={busy}
@@ -768,8 +807,8 @@ function PhotosApp({ appName, user, onLogout }: { appName: string; user: User; o
             </div>
             <span>
               {uploadState.processing
-                ? "Processing photos…"
-                : `Uploading ${uploadState.count} photo${uploadState.count === 1 ? "" : "s"} — ${uploadState.percent}%`}
+                ? "Processing items…"
+                : `Uploading ${uploadState.count} item${uploadState.count === 1 ? "" : "s"} — ${uploadState.percent}%`}
             </span>
           </div>
         </Overlay>
@@ -1624,6 +1663,7 @@ function LibraryView({
   onUpload,
   selectMode = false,
   selectedIds = new Set<string>(),
+  uploadHint,
 }: {
   activeAlbum: Album | null;
   assets: Asset[];
@@ -1640,6 +1680,7 @@ function LibraryView({
   onUpload: () => void;
   selectMode?: boolean;
   selectedIds?: Set<string>;
+  uploadHint?: string;
 }) {
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
   const longPressFired = useRef(false);
@@ -1695,11 +1736,12 @@ function LibraryView({
           <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
         )}
         <div className="empty-icon"><Images size={38} /></div>
-        <h2>No photos here</h2>
-        <button className="primary-button" onClick={onUpload} type="button">
+        <h2>No items here</h2>
+        <button className="primary-button" onClick={onUpload} title={uploadHint} type="button">
           <ImagePlus size={18} />
           <span>Upload</span>
         </button>
+        {uploadHint && <p className="upload-hint">{uploadHint}</p>}
       </section>
     );
   }
@@ -1766,11 +1808,13 @@ function LibraryView({
 function DropArea({
   children,
   dragging,
+  hint,
   onDragChange,
   onDrop
 }: {
   children: React.ReactNode;
   dragging: boolean;
+  hint?: string;
   onDragChange: (dragging: boolean) => void;
   onDrop: (event: React.DragEvent<HTMLElement>) => void;
 }) {
@@ -1792,7 +1836,8 @@ function DropArea({
       {dragging && (
         <div className="drop-overlay">
           <ImagePlus size={36} />
-          <strong>Drop photos to upload</strong>
+          <strong>Drop files to upload</strong>
+          {hint && <span className="drop-hint">{hint}</span>}
         </div>
       )}
     </section>
@@ -2307,6 +2352,10 @@ function groupAssets(assets: Asset[]) {
 
 function prettyDate(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
+}
+
+function formatMb(mb: number) {
+  return mb >= 1024 ? `${Math.round(mb / 1024)} GB` : `${mb} MB`;
 }
 
 function formatDuration(ms: number) {

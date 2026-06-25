@@ -387,6 +387,18 @@ button:disabled {
   backdrop-filter: blur(8px);
 }
 
+.drop-hint {
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 0.75;
+}
+
+.upload-hint {
+  margin: 0;
+  font-size: 13px;
+  color: #6b6960;
+}
+
 .date-group h2 {
   margin: 0 0 8px;
   font-size: 15px;

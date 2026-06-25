@@ -102,7 +102,9 @@ test("branding config and PWA manifest reflect APP_NAME defaults", async () => {
     appName: "Sjodin Photos",
     appShortName: "Photos",
     attributionText: "Photoalbum by Mats Sjödin",
-    attributionUrl: "https://matssjodin.com"
+    attributionUrl: "https://matssjodin.com",
+    maxUploadFileSizeMb: 120,
+    maxUploadVideoSizeMb: 2048
   });
 
   const manifest = await fetch(`${baseUrl}/manifest.webmanifest`);
