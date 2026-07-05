@@ -1,10 +1,11 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createPortal } from "react-dom";
 import {
   Archive,
   AlertTriangle,
   Camera,
+  Check,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -15,6 +16,9 @@ import {
   Info,
   Loader,
   LogOut,
+  Maximize,
+  Minimize,
+  Pause,
   Pencil,
   Play,
   Plus,
@@ -26,6 +30,8 @@ import {
   Trash2,
   UserPlus,
   Users,
+  Volume2,
+  VolumeX,
   X
 } from "lucide-react";
 import "./styles.css";
@@ -40,6 +46,15 @@ type User = {
   role: Role;
   disabled: boolean;
   createdAt: string;
+};
+
+type Storyboard = {
+  interval: number;
+  cols: number;
+  rows: number;
+  count: number;
+  tileWidth: number;
+  tileHeight: number;
 };
 
 type Asset = {
@@ -58,12 +73,15 @@ type Asset = {
   mediaType: "image" | "video";
   status: "processing" | "ready" | "failed";
   durationMs: number | null;
+  storyboard: Storyboard | null;
   urls: {
     thumb: string;
     preview: string;
     original: string | null;
     video: string | null;
     videoSd: string | null;
+    hls: string | null;
+    storyboard: string | null;
   };
 };
 
@@ -1241,37 +1259,11 @@ function ViewerStage({
   const zoom = useRef({ scale: 1, tx: 0, ty: 0 });
   const lastTap = useRef<{ time: number; x: number; y: number } | null>(null);
   const justSwiped = useRef(false);
-  // Video playback: native <video> handles its own gestures, so the swipe/zoom
-  // logic below is skipped when the current asset is a playable video.
+  // Video playback: the custom player handles its own gestures, so the
+  // swipe/zoom logic below is skipped when the current asset is a playable video.
   const isVideo = asset.mediaType === "video" && asset.status === "ready" && Boolean(asset.urls.video);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const [quality, setQuality] = useState<"hd" | "sd">("hd");
-  const resume = useRef<{ time: number; playing: boolean } | null>(null);
-  const videoSrc = quality === "sd" && asset.urls.videoSd ? asset.urls.videoSd : asset.urls.video;
   useBodyScrollLock();
   useBackClose(true, onClose);
-
-  useEffect(() => {
-    setQuality("hd");
-    resume.current = null;
-  }, [asset.id]);
-
-  function toggleQuality() {
-    const v = videoRef.current;
-    if (v) resume.current = { time: v.currentTime, playing: !v.paused };
-    setQuality((q) => (q === "hd" ? "sd" : "hd"));
-  }
-
-  // The <video> remounts on quality change (key includes quality), so restore
-  // the playhead and play state once the new rendition's metadata is ready.
-  function handleVideoMeta() {
-    const v = videoRef.current;
-    if (v && resume.current) {
-      v.currentTime = resume.current.time;
-      if (resume.current.playing) void v.play();
-      resume.current = null;
-    }
-  }
 
   useEffect(() => {
     zoom.current = { scale: 1, tx: 0, ty: 0 };
@@ -1285,13 +1277,19 @@ function ViewerStage({
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        // While fullscreen, Escape only exits fullscreen — don't also close.
+        if (!document.fullscreenElement) onClose();
+        return;
+      }
+      // For videos the player owns the arrow keys (they seek, YouTube-style).
+      if (isVideo) return;
       if (event.key === "ArrowLeft" && previous) onSelect(previous);
       if (event.key === "ArrowRight" && next) onSelect(next);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [next, previous, onClose, onSelect]);
+  }, [next, previous, onClose, onSelect, isVideo]);
 
   useEffect(() => {
     for (const neighbour of [previous, next]) {
@@ -1479,11 +1477,6 @@ function ViewerStage({
           <div className="viewer-topbar">
             <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
             <div className="viewer-actions">
-              {isVideo && asset.urls.videoSd && (
-                <button className="icon-button light viewer-quality" onClick={toggleQuality} type="button" title="Toggle quality">
-                  {quality === "hd" ? "HD" : "SD"}
-                </button>
-              )}
               {actions}
             </div>
           </div>
@@ -1493,18 +1486,7 @@ function ViewerStage({
             </button>
           )}
           {isVideo ? (
-            <video
-              autoPlay
-              className="viewer-video"
-              controls
-              key={`${asset.id}-${quality}`}
-              onLoadedMetadata={handleVideoMeta}
-              playsInline
-              poster={asset.urls.preview}
-              preload="metadata"
-              ref={videoRef}
-              src={videoSrc ?? undefined}
-            />
+            <VideoPlayer asset={asset} key={asset.id} />
           ) : (
             <>
               {!loaded && (
@@ -1531,6 +1513,657 @@ function ViewerStage({
         {panel}
       </div>
     </Overlay>
+  );
+}
+
+const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
+const CONTROLS_HIDE_MS = 2600;
+const DOUBLE_TAP_MS = 300;
+const playerPrefsKey = "sjodinPhotos.player";
+
+function loadPlayerPrefs(): { volume: number; muted: boolean; rate: number } {
+  try {
+    const raw = JSON.parse(localStorage.getItem(playerPrefsKey) ?? "{}") as Partial<{ volume: number; muted: boolean; rate: number }>;
+    return {
+      volume: typeof raw.volume === "number" ? Math.min(1, Math.max(0, raw.volume)) : 1,
+      muted: Boolean(raw.muted),
+      rate: typeof raw.rate === "number" && PLAYBACK_RATES.includes(raw.rate) ? raw.rate : 1
+    };
+  } catch {
+    return { volume: 1, muted: false, rate: 1 };
+  }
+}
+
+/**
+ * Custom video player (YouTube/Google Photos style): adaptive HLS streaming
+ * with automatic quality switching (hls.js, or Safari's native HLS), scrub bar
+ * with storyboard thumbnail previews, playback speed and quality menus,
+ * keyboard shortcuts, double-tap seeking on touch, and auto-hiding controls.
+ * Falls back to the progressive MP4 renditions when HLS isn't available.
+ * Remounted per asset (keyed on asset.id), so all state is per-video.
+ */
+function VideoPlayer({ asset }: { asset: Asset }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const railRef = useRef<HTMLDivElement | null>(null);
+  const hlsRef = useRef<import("hls.js").default | null>(null);
+  const hideTimer = useRef<number | null>(null);
+  const singleTapTimer = useRef<number | null>(null);
+  const lastTap = useRef<{ time: number; x: number } | null>(null);
+  const lastPointerType = useRef<string>("mouse");
+  const scrubbing = useRef(false);
+  const scrubWasPlaying = useRef(false);
+  // Playhead/play-state carried across quality-triggered source swaps.
+  const resumeRef = useRef<{ time: number; playing: boolean } | null>(null);
+  const prefs = useRef(loadPlayerPrefs());
+
+  const [engine, setEngine] = useState<"hls" | "native" | "mp4">("mp4");
+  // useMp4 forces the progressive renditions (no HLS asset yet, hls.js
+  // unsupported, or the user picked an explicit rendition on native-HLS Safari).
+  const [useMp4, setUseMp4] = useState(!asset.urls.hls);
+  const [mp4Quality, setMp4Quality] = useState<"hd" | "sd">("hd");
+  const [playing, setPlaying] = useState(false);
+  const [stalled, setStalled] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const [time, setTime] = useState(0);
+  const [duration, setDuration] = useState((asset.durationMs ?? 0) / 1000);
+  const [buffered, setBuffered] = useState(0);
+  const [muted, setMuted] = useState(prefs.current.muted);
+  const [volume, setVolume] = useState(prefs.current.volume);
+  const [rate, setRate] = useState(prefs.current.rate);
+  const [levels, setLevels] = useState<number[]>([]);
+  const [manualLevel, setManualLevel] = useState(-1);
+  const [autoHeight, setAutoHeight] = useState<number | null>(null);
+  const [menu, setMenu] = useState<"none" | "speed" | "quality">("none");
+  const [controlsOn, setControlsOn] = useState(true);
+  const [scrub, setScrub] = useState<number | null>(null);
+  const [hover, setHover] = useState<number | null>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [skip, setSkip] = useState<{ side: "back" | "forward"; id: number } | null>(null);
+  const menuRef = useRef(menu);
+  menuRef.current = menu;
+
+  const bumpControls = useCallback(() => {
+    setControlsOn(true);
+    if (hideTimer.current) window.clearTimeout(hideTimer.current);
+    hideTimer.current = window.setTimeout(() => {
+      const v = videoRef.current;
+      if (v && !v.paused && !scrubbing.current && menuRef.current === "none") setControlsOn(false);
+    }, CONTROLS_HIDE_MS);
+  }, []);
+
+  // Pick and attach the source. Reruns when the user forces a rendition; the
+  // asset itself is fixed for the component's lifetime (keyed remount).
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    let cancelled = false;
+    let hls: import("hls.js").default | null = null;
+    const resume = resumeRef.current;
+    resumeRef.current = null;
+
+    video.addEventListener("loadedmetadata", function restore() {
+      video.playbackRate = prefs.current.rate;
+      if (resume?.time) video.currentTime = resume.time;
+      if (!resume || resume.playing) void video.play().catch(() => undefined);
+    }, { once: true });
+
+    async function setup() {
+      const hlsUrl = asset.urls.hls;
+      if (hlsUrl && !useMp4) {
+        // hls.js (MSE) first: some browsers claim canPlayType("…mpegurl")
+        // without reliably streaming it. Native HLS is the fallback for
+        // browsers without MSE (iOS Safari), where it works properly.
+        const HlsCtor = (await import("hls.js")).default;
+        if (cancelled) return;
+        if (HlsCtor.isSupported()) {
+          hls = new HlsCtor({ capLevelToPlayerSize: true });
+          hlsRef.current = hls;
+          hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
+            if (!cancelled && hls) setLevels(hls.levels.map((level) => level.height));
+          });
+          hls.on(HlsCtor.Events.LEVEL_SWITCHED, (_event, data) => {
+            if (!cancelled && hls) setAutoHeight(hls.levels[data.level]?.height ?? null);
+          });
+          hls.on(HlsCtor.Events.ERROR, (_event, data) => {
+            if (!data.fatal || cancelled) return;
+            // One shot at recovery, then drop to the plain MP4 renditions.
+            if (data.type === "networkError") hls?.startLoad();
+            else if (data.type === "mediaError") hls?.recoverMediaError();
+            else setUseMp4(true);
+          });
+          hls.loadSource(hlsUrl);
+          hls.attachMedia(video!);
+          setEngine("hls");
+          return;
+        }
+        if (video!.canPlayType("application/vnd.apple.mpegurl")) {
+          setEngine("native");
+          video!.src = hlsUrl;
+          return;
+        }
+      }
+      setEngine("mp4");
+      const src = (mp4Quality === "sd" && asset.urls.videoSd) || asset.urls.video;
+      if (src) video!.src = src;
+    }
+    void setup();
+
+    return () => {
+      cancelled = true;
+      if (hls) hls.destroy();
+      if (hlsRef.current === hls) hlsRef.current = null;
+      video.removeAttribute("src");
+      video.load();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useMp4, mp4Quality]);
+
+  // Apply persisted prefs and wire up media element state.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.volume = prefs.current.volume;
+    v.muted = prefs.current.muted;
+    v.defaultPlaybackRate = prefs.current.rate;
+    v.playbackRate = prefs.current.rate;
+
+    function readBuffered() {
+      if (!v) return;
+      const ranges = v.buffered;
+      for (let i = 0; i < ranges.length; i += 1) {
+        if (ranges.start(i) <= v.currentTime && v.currentTime <= ranges.end(i)) {
+          setBuffered(ranges.end(i));
+          return;
+        }
+      }
+      setBuffered(ranges.length ? ranges.end(ranges.length - 1) : 0);
+    }
+    const onTime = () => {
+      if (!scrubbing.current && v) setTime(v.currentTime);
+      readBuffered();
+    };
+    const onDuration = () => {
+      if (v && Number.isFinite(v.duration)) setDuration(v.duration);
+    };
+    const onPlay = () => {
+      setPlaying(true);
+      setEnded(false);
+      bumpControls();
+    };
+    const onPause = () => {
+      setPlaying(false);
+      setControlsOn(true);
+      if (hideTimer.current) window.clearTimeout(hideTimer.current);
+    };
+    const onVolume = () => {
+      if (!v) return;
+      setMuted(v.muted);
+      setVolume(v.volume);
+      prefs.current = { ...prefs.current, volume: v.volume, muted: v.muted };
+      localStorage.setItem(playerPrefsKey, JSON.stringify(prefs.current));
+    };
+    const onRate = () => {
+      if (v) setRate(v.playbackRate);
+    };
+    const onWaiting = () => setStalled(true);
+    const onPlaying = () => setStalled(false);
+    const onEnded = () => {
+      setEnded(true);
+      setControlsOn(true);
+    };
+    v.addEventListener("timeupdate", onTime);
+    v.addEventListener("durationchange", onDuration);
+    v.addEventListener("loadedmetadata", onDuration);
+    v.addEventListener("play", onPlay);
+    v.addEventListener("pause", onPause);
+    v.addEventListener("volumechange", onVolume);
+    v.addEventListener("ratechange", onRate);
+    v.addEventListener("waiting", onWaiting);
+    v.addEventListener("playing", onPlaying);
+    v.addEventListener("canplay", onPlaying);
+    v.addEventListener("progress", readBuffered);
+    v.addEventListener("ended", onEnded);
+    return () => {
+      v.removeEventListener("timeupdate", onTime);
+      v.removeEventListener("durationchange", onDuration);
+      v.removeEventListener("loadedmetadata", onDuration);
+      v.removeEventListener("play", onPlay);
+      v.removeEventListener("pause", onPause);
+      v.removeEventListener("volumechange", onVolume);
+      v.removeEventListener("ratechange", onRate);
+      v.removeEventListener("waiting", onWaiting);
+      v.removeEventListener("playing", onPlaying);
+      v.removeEventListener("canplay", onPlaying);
+      v.removeEventListener("progress", readBuffered);
+      v.removeEventListener("ended", onEnded);
+      if (hideTimer.current) window.clearTimeout(hideTimer.current);
+      if (singleTapTimer.current) window.clearTimeout(singleTapTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const onFullscreen = () => setFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", onFullscreen);
+    return () => document.removeEventListener("fullscreenchange", onFullscreen);
+  }, []);
+
+  function togglePlay() {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.ended) {
+      v.currentTime = 0;
+      void v.play().catch(() => undefined);
+    } else if (v.paused) {
+      void v.play().catch(() => undefined);
+    } else {
+      v.pause();
+    }
+  }
+
+  function seekBy(seconds: number) {
+    const v = videoRef.current;
+    if (!v || !Number.isFinite(v.duration)) return;
+    v.currentTime = Math.min(Math.max(v.currentTime + seconds, 0), v.duration);
+    setTime(v.currentTime);
+    setEnded(v.ended);
+  }
+
+  function toggleMute() {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = !v.muted;
+    if (!v.muted && v.volume === 0) v.volume = 0.5;
+  }
+
+  function toggleFullscreen() {
+    const wrap = wrapRef.current;
+    const v = videoRef.current as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null;
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => undefined);
+      return;
+    }
+    if (wrap?.requestFullscreen) {
+      wrap.requestFullscreen().catch(() => v?.webkitEnterFullscreen?.());
+    } else {
+      // iPhone Safari: no element fullscreen; use the native video presenter.
+      v?.webkitEnterFullscreen?.();
+    }
+  }
+
+  function flashSkip(side: "back" | "forward") {
+    seekBy(side === "back" ? -10 : 10);
+    setSkip({ side, id: Date.now() });
+    window.setTimeout(() => setSkip((current) => (current?.side === side ? null : current)), 700);
+  }
+
+  // Keyboard shortcuts (YouTube-style). Attached per player instance.
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      const v = videoRef.current;
+      if (!v) return;
+      switch (event.key) {
+        case " ":
+        case "k":
+          event.preventDefault();
+          togglePlay();
+          break;
+        case "ArrowLeft":
+          event.preventDefault();
+          seekBy(-5);
+          break;
+        case "ArrowRight":
+          event.preventDefault();
+          seekBy(5);
+          break;
+        case "j":
+          seekBy(-10);
+          break;
+        case "l":
+          seekBy(10);
+          break;
+        case "ArrowUp":
+          event.preventDefault();
+          v.volume = Math.min(1, v.volume + 0.1);
+          v.muted = false;
+          break;
+        case "ArrowDown":
+          event.preventDefault();
+          v.volume = Math.max(0, v.volume - 0.1);
+          break;
+        case "m":
+          toggleMute();
+          break;
+        case "f":
+          toggleFullscreen();
+          break;
+        default:
+          if (/^[0-9]$/.test(event.key) && Number.isFinite(v.duration)) {
+            v.currentTime = (Number(event.key) / 10) * v.duration;
+            setTime(v.currentTime);
+          } else {
+            return;
+          }
+      }
+      bumpControls();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Tap/click on the stage: mouse toggles play (double-click fullscreens);
+  // touch toggles the controls, double-tap on the side thirds skips ±10s.
+  function handleStagePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    lastPointerType.current = event.pointerType;
+    if (event.pointerType === "mouse") {
+      togglePlay();
+      bumpControls();
+      return;
+    }
+    const rect = event.currentTarget.getBoundingClientRect();
+    const fraction = rect.width ? (event.clientX - rect.left) / rect.width : 0.5;
+    const now = Date.now();
+    const last = lastTap.current;
+    lastTap.current = { time: now, x: event.clientX };
+    if (last && now - last.time < DOUBLE_TAP_MS && Math.abs(event.clientX - last.x) < 80) {
+      lastTap.current = null;
+      if (singleTapTimer.current) {
+        window.clearTimeout(singleTapTimer.current);
+        singleTapTimer.current = null;
+      }
+      if (fraction < 0.35) flashSkip("back");
+      else if (fraction > 0.65) flashSkip("forward");
+      else togglePlay();
+      bumpControls();
+      return;
+    }
+    singleTapTimer.current = window.setTimeout(() => {
+      singleTapTimer.current = null;
+      if (menuRef.current !== "none") {
+        setMenu("none");
+        return;
+      }
+      setControlsOn((on) => {
+        if (on) {
+          if (hideTimer.current) window.clearTimeout(hideTimer.current);
+          return false;
+        }
+        bumpControls();
+        return true;
+      });
+    }, DOUBLE_TAP_MS);
+  }
+
+  function handleStageDoubleClick() {
+    if (lastPointerType.current === "mouse") toggleFullscreen();
+  }
+
+  function railFraction(event: React.PointerEvent): number {
+    const rail = railRef.current;
+    if (!rail) return 0;
+    const rect = rail.getBoundingClientRect();
+    if (!rect.width) return 0;
+    return Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+  }
+
+  function handleRailPointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    scrubbing.current = true;
+    const v = videoRef.current;
+    scrubWasPlaying.current = Boolean(v && !v.paused && !v.ended);
+    v?.pause();
+    setScrub(railFraction(event));
+    bumpControls();
+  }
+
+  function handleRailPointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (scrubbing.current) {
+      setScrub(railFraction(event));
+      bumpControls();
+    } else if (event.pointerType === "mouse") {
+      setHover(railFraction(event));
+    }
+  }
+
+  function handleRailPointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (!scrubbing.current) return;
+    scrubbing.current = false;
+    const fraction = railFraction(event);
+    const v = videoRef.current;
+    if (v && duration > 0) {
+      v.currentTime = fraction * duration;
+      setTime(v.currentTime);
+      setEnded(false);
+    }
+    setScrub(null);
+    if (scrubWasPlaying.current) void v?.play().catch(() => undefined);
+    bumpControls();
+  }
+
+  function selectLevel(level: number) {
+    const hls = hlsRef.current;
+    if (hls) hls.currentLevel = level;
+    setManualLevel(level);
+    setMenu("none");
+  }
+
+  function selectMp4Quality(quality: "hd" | "sd") {
+    const v = videoRef.current;
+    if (v) resumeRef.current = { time: v.currentTime, playing: !v.paused && !v.ended };
+    setUseMp4(true);
+    setMp4Quality(quality);
+    setMenu("none");
+  }
+
+  function selectAutoSource() {
+    const v = videoRef.current;
+    if (v) resumeRef.current = { time: v.currentTime, playing: !v.paused && !v.ended };
+    setUseMp4(false);
+    setMenu("none");
+  }
+
+  type MenuOption = { key: string; label: string; active: boolean; onSelect: () => void };
+
+  function qualityOptions(): MenuOption[] {
+    if (engine === "hls") {
+      const auto: MenuOption = {
+        key: "auto",
+        label: manualLevel === -1 && autoHeight ? `Auto (${autoHeight}p)` : "Auto",
+        active: manualLevel === -1,
+        onSelect: () => selectLevel(-1)
+      };
+      const manual = levels
+        .map((height, index) => ({ height, index }))
+        .sort((a, b) => b.height - a.height)
+        .map(({ height, index }) => ({
+          key: `l${index}`,
+          label: `${height}p`,
+          active: manualLevel === index,
+          onSelect: () => selectLevel(index)
+        }));
+      return [auto, ...manual];
+    }
+    const options: MenuOption[] = [];
+    if (asset.urls.hls) {
+      options.push({ key: "auto", label: "Auto", active: !useMp4, onSelect: selectAutoSource });
+    }
+    options.push({ key: "hd", label: "1080p", active: useMp4 && mp4Quality === "hd", onSelect: () => selectMp4Quality("hd") });
+    if (asset.urls.videoSd) {
+      options.push({ key: "sd", label: "480p", active: useMp4 && mp4Quality === "sd", onSelect: () => selectMp4Quality("sd") });
+    }
+    return options;
+  }
+
+  const displayFraction = scrub ?? (duration > 0 ? Math.min(1, time / duration) : 0);
+  const bufferedFraction = duration > 0 ? Math.min(1, buffered / duration) : 0;
+  const previewFraction = scrub ?? hover;
+  const storyboard = asset.storyboard && asset.urls.storyboard ? asset.storyboard : null;
+  const qualityLabel = engine === "hls"
+    ? (manualLevel === -1 ? "Auto" : `${levels[manualLevel] ?? "?"}p`)
+    : engine === "native"
+      ? "Auto"
+      : mp4Quality === "hd"
+        ? "1080p"
+        : "480p";
+
+  let preview: React.ReactNode = null;
+  if (previewFraction != null && duration > 0) {
+    const previewTime = previewFraction * duration;
+    let thumb: React.ReactNode = null;
+    let halfWidth = 36;
+    if (storyboard) {
+      const index = Math.min(storyboard.count - 1, Math.max(0, Math.floor(previewTime / storyboard.interval)));
+      const col = index % storyboard.cols;
+      const rowIndex = Math.floor(index / storyboard.cols);
+      halfWidth = storyboard.tileWidth / 2 + 4;
+      thumb = (
+        <div
+          className="vp-preview-thumb"
+          style={{
+            width: storyboard.tileWidth,
+            height: storyboard.tileHeight,
+            backgroundImage: `url(${asset.urls.storyboard})`,
+            backgroundPosition: `-${col * storyboard.tileWidth}px -${rowIndex * storyboard.tileHeight}px`,
+            backgroundSize: `${storyboard.cols * storyboard.tileWidth}px ${storyboard.rows * storyboard.tileHeight}px`
+          }}
+        />
+      );
+    }
+    preview = (
+      <div
+        className="vp-preview"
+        style={{ left: `clamp(${halfWidth}px, ${previewFraction * 100}%, calc(100% - ${halfWidth}px))` }}
+      >
+        {thumb}
+        <span className="vp-preview-time">{formatDuration(previewTime * 1000)}</span>
+      </div>
+    );
+  }
+
+  const menuItems = menu === "speed"
+    ? PLAYBACK_RATES.map((value) => ({
+        key: `r${value}`,
+        label: value === 1 ? "Normal" : `${value}×`,
+        active: rate === value,
+        onSelect: () => {
+          const v = videoRef.current;
+          if (v) {
+            v.playbackRate = value;
+            v.defaultPlaybackRate = value;
+          }
+          prefs.current = { ...prefs.current, rate: value };
+          localStorage.setItem(playerPrefsKey, JSON.stringify(prefs.current));
+          setMenu("none");
+        }
+      }))
+    : menu === "quality"
+      ? qualityOptions()
+      : [];
+
+  return (
+    <div className={controlsOn ? "vp" : "vp controls-hidden"} ref={wrapRef} onPointerMove={(event) => {
+      if (event.pointerType === "mouse") bumpControls();
+    }}>
+      <video
+        className="vp-video"
+        playsInline
+        poster={asset.urls.preview}
+        preload="metadata"
+        ref={videoRef}
+      />
+      <div className="vp-tap" onDoubleClick={handleStageDoubleClick} onPointerUp={handleStagePointerUp} />
+      {skip && (
+        <div className={`vp-skip ${skip.side}`} key={skip.id}>
+          {skip.side === "back" ? "-10s" : "+10s"}
+        </div>
+      )}
+      {stalled && playing && !ended && (
+        <div className="vp-center passive"><Loader className="spin" size={40} /></div>
+      )}
+      {(!playing || ended) && !stalled && (
+        <button className="vp-center" onClick={togglePlay} title={ended ? "Replay" : "Play"} type="button">
+          {ended ? <RotateCcw size={30} /> : <Play size={30} />}
+        </button>
+      )}
+      <div className="vp-controls" onPointerUp={(event) => event.stopPropagation()}>
+        <div
+          className="vp-scrub"
+          onPointerCancel={handleRailPointerUp}
+          onPointerDown={handleRailPointerDown}
+          onPointerLeave={() => setHover(null)}
+          onPointerMove={handleRailPointerMove}
+          onPointerUp={handleRailPointerUp}
+        >
+          {preview}
+          <div className="vp-rail" ref={railRef}>
+            <div className="vp-rail-buffered" style={{ width: `${bufferedFraction * 100}%` }} />
+            <div className="vp-rail-played" style={{ width: `${displayFraction * 100}%` }} />
+            <div className="vp-knob" style={{ left: `${displayFraction * 100}%` }} />
+          </div>
+        </div>
+        <div className="vp-buttons">
+          <button className="vp-button" onClick={togglePlay} title={playing ? "Pause (k)" : "Play (k)"} type="button">
+            {ended ? <RotateCcw size={22} /> : playing ? <Pause size={22} /> : <Play size={22} />}
+          </button>
+          <button className="vp-button" onClick={toggleMute} title={muted ? "Unmute (m)" : "Mute (m)"} type="button">
+            {muted || volume === 0 ? <VolumeX size={22} /> : <Volume2 size={22} />}
+          </button>
+          <input
+            aria-label="Volume"
+            className="vp-volume"
+            max={1}
+            min={0}
+            onChange={(event) => {
+              const v = videoRef.current;
+              if (!v) return;
+              v.volume = Number(event.target.value);
+              v.muted = false;
+            }}
+            step={0.05}
+            type="range"
+            value={muted ? 0 : volume}
+          />
+          <span className="vp-time">
+            {formatDuration(Math.round(displayFraction * duration * 1000))} / {formatDuration(Math.round(duration * 1000))}
+          </span>
+          <span className="vp-spacer" />
+          <button
+            className={rate !== 1 ? "vp-button text active" : "vp-button text"}
+            onClick={() => setMenu((current) => (current === "speed" ? "none" : "speed"))}
+            title="Playback speed"
+            type="button"
+          >
+            {rate === 1 ? "1×" : `${rate}×`}
+          </button>
+          <button
+            className={engine === "hls" && manualLevel !== -1 ? "vp-button text active" : "vp-button text"}
+            onClick={() => setMenu((current) => (current === "quality" ? "none" : "quality"))}
+            title="Quality"
+            type="button"
+          >
+            {qualityLabel}
+          </button>
+          <button className="vp-button" onClick={toggleFullscreen} title="Fullscreen (f)" type="button">
+            {fullscreen ? <Minimize size={22} /> : <Maximize size={22} />}
+          </button>
+        </div>
+        {menu !== "none" && (
+          <div className="vp-menu">
+            {menuItems.map((item) => (
+              <button className={item.active ? "active" : ""} key={item.key} onClick={item.onSelect} type="button">
+                <span className="vp-menu-check">{item.active ? <Check size={16} /> : null}</span>
+                {item.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 

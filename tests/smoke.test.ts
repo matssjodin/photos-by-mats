@@ -74,7 +74,7 @@ async function makeMp4(): Promise<Buffer> {
     const child = spawn(ffmpegBin, [
       "-y",
       "-f", "lavfi",
-      "-i", "testsrc=duration=1:size=320x240:rate=15",
+      "-i", "testsrc=duration=2:size=320x240:rate=15",
       "-pix_fmt", "yuv420p",
       out
     ], { stdio: "ignore" });
@@ -456,7 +456,12 @@ test("video upload transcodes in the background and serves streamable renditions
   assert.equal(video.urls.video, null, "renditions are not exposed until transcoding finishes");
 
   // Poll until the background transcode flips the asset to ready.
-  type Listed = { id: string; status: string; urls: { video: string | null; videoSd: string | null; original: string | null } };
+  type Listed = {
+    id: string;
+    status: string;
+    storyboard: { interval: number; cols: number; rows: number; count: number; tileWidth: number; tileHeight: number } | null;
+    urls: { video: string | null; videoSd: string | null; original: string | null; hls: string | null; storyboard: string | null };
+  };
   const deadline = Date.now() + 60000;
   let ready: Listed | undefined;
   for (;;) {
@@ -482,6 +487,76 @@ test("video upload transcodes in the background and serves streamable renditions
   assert.ok(ready.urls.videoSd);
   const sd = await fetch(`${baseUrl}${ready.urls.videoSd}`, { headers: authedHeaders() });
   assert.equal(sd.status, 200);
+
+  // Adaptive streaming: the master playlist advertises both renditions and the
+  // media playlists reference byte ranges of the rendition MP4s via the API.
+  assert.ok(ready.urls.hls, "ready videos expose an HLS master playlist");
+  const master = await fetch(`${baseUrl}${ready.urls.hls}`, { headers: authedHeaders() });
+  assert.equal(master.status, 200);
+  assert.ok((master.headers.get("content-type") ?? "").includes("mpegurl"));
+  const masterText = await master.text();
+  assert.ok(masterText.includes("#EXT-X-STREAM-INF"));
+  assert.ok(masterText.includes("v1080.m3u8"));
+  assert.ok(masterText.includes("v480.m3u8"));
+
+  const variantUrl = ready.urls.hls!.replace(/master\.m3u8$/, "v1080.m3u8");
+  const variant = await fetch(`${baseUrl}${variantUrl}`, { headers: authedHeaders() });
+  assert.equal(variant.status, 200);
+  const variantText = await variant.text();
+  assert.ok(variantText.includes("#EXT-X-BYTERANGE"));
+  assert.ok(variantText.includes("../file/video"));
+
+  // The playlist's relative media URI must resolve to a Range-capable endpoint.
+  const byteRange = variantText.match(/#EXT-X-BYTERANGE:(\d+)@(\d+)/);
+  assert.ok(byteRange, "media playlist declares byte-range segments");
+  const mediaUrl = new URL("../file/video", `${baseUrl}${variantUrl}`);
+  const rangeStart = Number(byteRange![2]);
+  const rangeEnd = rangeStart + Number(byteRange![1]) - 1;
+  const segment = await fetch(mediaUrl, { headers: authedHeaders({ Range: `bytes=${rangeStart}-${rangeEnd}` }) });
+  assert.equal(segment.status, 206);
+
+  // HLS playlists require an authenticated session.
+  const anonymous = await fetch(`${baseUrl}${ready.urls.hls}`);
+  assert.equal(anonymous.status, 401);
+
+  // Scrub-preview storyboard sprite plus its layout metadata.
+  assert.ok(ready.storyboard, "ready videos include storyboard metadata");
+  assert.ok(ready.storyboard!.count >= 1);
+  assert.ok(ready.urls.storyboard);
+  const sprite = await fetch(`${baseUrl}${ready.urls.storyboard}`, { headers: authedHeaders() });
+  assert.equal(sprite.status, 200);
+  assert.equal(sprite.headers.get("content-type"), "image/jpeg");
+
+  // Shared albums stream over the share-scoped HLS routes (never the original).
+  const albumResponse = await fetch(`${baseUrl}/api/albums`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ title: "Video share" })
+  });
+  const { album } = await albumResponse.json() as { album: { id: string } };
+  await fetch(`${baseUrl}/api/albums/${album.id}/assets`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ assetIds: [video.id] })
+  });
+  const shareResponse = await fetch(`${baseUrl}/api/albums/${album.id}/share`, { method: "POST", headers: authedHeaders() });
+  const { album: sharedAlbum } = await shareResponse.json() as { album: { shareToken: string } };
+  const publicList = await fetch(`${baseUrl}/api/share/${sharedAlbum.shareToken}`);
+  const publicBody = await publicList.json() as { assets: Listed[] };
+  const publicVideo = publicBody.assets.find((a) => a.id === video.id);
+  assert.ok(publicVideo?.urls.hls, "shared videos expose the share-scoped HLS playlist");
+  assert.equal(publicVideo!.urls.original, null);
+  const publicMaster = await fetch(`${baseUrl}${publicVideo!.urls.hls}`);
+  assert.equal(publicMaster.status, 200);
+  const publicVariantUrl = publicVideo!.urls.hls!.replace(/master\.m3u8$/, "v480.m3u8");
+  const publicVariant = await fetch(`${baseUrl}${publicVariantUrl}`);
+  assert.equal(publicVariant.status, 200);
+  const publicVariantText = await publicVariant.text();
+  assert.ok(publicVariantText.includes("../file/video_sd"));
+  const publicMedia = await fetch(new URL("../file/video_sd", `${baseUrl}${publicVariantUrl}`));
+  assert.equal(publicMedia.status, 200, "share playlist media URIs must resolve without auth");
+  const publicSprite = await fetch(`${baseUrl}${publicVideo!.urls.storyboard}`);
+  assert.equal(publicSprite.status, 200);
 
   // Owner "original" download serves the 1080p MP4 with a .mp4 filename.
   assert.ok(ready.urls.original);

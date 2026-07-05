@@ -95,6 +95,9 @@ type AssetRow = {
   duration_ms: number | null;
   video_path: string | null;
   video_sd_path: string | null;
+  hls_path: string | null;
+  storyboard_path: string | null;
+  storyboard_meta: string | null;
 };
 
 type AlbumRow = {
@@ -213,6 +216,9 @@ ensureColumn("assets", "status", "TEXT NOT NULL DEFAULT 'ready'");
 ensureColumn("assets", "duration_ms", "INTEGER");
 ensureColumn("assets", "video_path", "TEXT");
 ensureColumn("assets", "video_sd_path", "TEXT");
+ensureColumn("assets", "hls_path", "TEXT");
+ensureColumn("assets", "storyboard_path", "TEXT");
+ensureColumn("assets", "storyboard_meta", "TEXT");
 // Photos trashed before this column existed start their retention clock now.
 db.prepare("UPDATE assets SET trashed_at = ? WHERE trashed = 1 AND trashed_at IS NULL").run(new Date().toISOString());
 db.exec(`
@@ -257,21 +263,24 @@ app.get("/api/share/:token", (req, res) => {
   });
 });
 
-app.get("/api/share/:token/file/:assetId/:variant", (req, res) => {
-  const token = String(req.params.token);
-  const assetId = String(req.params.assetId);
-  const variant = String(req.params.variant);
+/** Look up a non-trashed asset that belongs to the album behind a share token. */
+function findSharedAsset(token: string, assetId: string): AssetRow | undefined {
   const album = db.prepare("SELECT * FROM albums WHERE share_token = ?").get(token) as AlbumRow | undefined;
-  if (!album || !["thumb", "preview", "video", "video_sd"].includes(variant)) {
-    res.status(404).json({ error: "Shared asset not found." });
-    return;
-  }
-
-  const asset = db.prepare(`
+  if (!album) return undefined;
+  return db.prepare(`
     SELECT assets.* FROM album_assets
     JOIN assets ON assets.id = album_assets.asset_id
     WHERE album_assets.album_id = ? AND assets.id = ? AND assets.trashed = 0
   `).get(album.id, assetId) as AssetRow | undefined;
+}
+
+function serveSharedAssetFile(req: express.Request, res: express.Response) {
+  const variant = String(req.params.variant);
+  if (!["thumb", "preview", "video", "video_sd", "storyboard"].includes(variant)) {
+    res.status(404).json({ error: "Shared asset not found." });
+    return;
+  }
+  const asset = findSharedAsset(String(req.params.token), String(req.params.assetId));
   if (!asset) {
     res.status(404).json({ error: "Shared asset not found." });
     return;
@@ -282,11 +291,27 @@ app.get("/api/share/:token/file/:assetId/:variant", (req, res) => {
   else if (variant === "preview") relPath = asset.preview_path;
   else if (variant === "video") relPath = (asset.status === "ready" && asset.video_path) || "";
   else if (variant === "video_sd") relPath = (asset.status === "ready" && asset.video_sd_path) || "";
+  else if (variant === "storyboard") relPath = asset.storyboard_path ?? "";
   if (!relPath) {
     res.status(404).json({ error: "Shared asset not found." });
     return;
   }
   sendAssetFile(res, relPath);
+}
+
+app.get("/api/share/:token/file/:assetId/:variant", serveSharedAssetFile);
+// Alias with the asset id one level deeper so the relative URIs inside the HLS
+// playlists ("../file/video") resolve to a valid share URL — see hlsFileNames.
+app.get("/api/share/:token/assets/:assetId/file/:variant", serveSharedAssetFile);
+
+app.get("/api/share/:token/assets/:assetId/hls/:file", (req, res) => {
+  const file = String(req.params.file);
+  const asset = findSharedAsset(String(req.params.token), String(req.params.assetId));
+  if (!asset || !hlsFileNames.has(file) || asset.status !== "ready" || !asset.hls_path) {
+    res.status(404).json({ error: "Shared asset not found." });
+    return;
+  }
+  sendAssetFile(res, path.join(path.dirname(asset.hls_path), file));
 });
 
 app.post("/api/auth/login", (req, res) => {
@@ -533,6 +558,7 @@ app.get("/api/assets/:id/file/:variant", (req, res) => {
   else if (variant === "preview") relPath = asset.preview_path;
   else if (variant === "video") relPath = (isVideo && asset.status === "ready" && asset.video_path) || "";
   else if (variant === "video_sd") relPath = (isVideo && asset.status === "ready" && asset.video_sd_path) || "";
+  else if (variant === "storyboard") relPath = asset.storyboard_path ?? "";
   else if (variant === "original") relPath = isVideo ? (asset.status === "ready" && asset.video_path) || "" : asset.preview_path;
 
   if (!relPath) {
@@ -544,6 +570,22 @@ app.get("/api/assets/:id/file/:variant", (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(name)}"`);
   }
   sendAssetFile(res, relPath);
+});
+
+// HLS playlists live in the asset dir's hls/ subfolder. The media segments are
+// byte ranges of the rendition MP4s themselves, referenced from the playlists
+// as "../file/video[_sd]", so this route only ever serves the tiny .m3u8 files.
+const hlsFileNames = new Set(["master.m3u8", "v1080.m3u8", "v480.m3u8"]);
+
+app.get("/api/assets/:id/hls/:file", (req, res) => {
+  const user = authUser(req);
+  const asset = findOwnedAsset(String(req.params.id), user);
+  const file = String(req.params.file);
+  if (!asset || !hlsFileNames.has(file) || asset.status !== "ready" || !asset.hls_path) {
+    res.status(404).json({ error: "Asset not found." });
+    return;
+  }
+  sendAssetFile(res, path.join(path.dirname(asset.hls_path), file));
 });
 
 app.patch("/api/assets/:id", (req, res) => {
@@ -941,6 +983,7 @@ const server = app.listen(port, () => {
     .then(() => migrateOriginalsToWebp())
     .catch((error) => console.error("WebP migration failed:", error));
   resumeVideoProcessing();
+  enqueueVideoUpgrades();
 });
 // Node's 5s default races with the reverse proxies in front (Cloudflare and
 // Coolify's proxy reuse idle origin connections): a request sent just as Node
@@ -1413,34 +1456,38 @@ async function ingestVideo(
     return { asset: toPublicAsset(restoreIfTrashed(winner)), duplicate: true };
   }
 
-  enqueueTranscode(id);
+  enqueueVideoJob("transcode", id);
   const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow;
   return { asset: toPublicAsset(row), duplicate: false };
 }
 
 // ---- Background video transcode queue ----------------------------------
 
-const transcodeQueue: string[] = [];
-const transcodeQueued = new Set<string>();
-let activeTranscodes = 0;
+type VideoJobKind = "transcode" | "upgrade";
 
-function enqueueTranscode(assetId: string) {
-  if (transcodeQueued.has(assetId)) return;
-  transcodeQueued.add(assetId);
-  transcodeQueue.push(assetId);
-  pumpTranscodeQueue();
+const videoJobQueue: Array<{ assetId: string; kind: VideoJobKind }> = [];
+const videoJobsQueued = new Set<string>();
+let activeVideoJobs = 0;
+
+function enqueueVideoJob(kind: VideoJobKind, assetId: string) {
+  const key = `${kind}:${assetId}`;
+  if (videoJobsQueued.has(key)) return;
+  videoJobsQueued.add(key);
+  videoJobQueue.push({ assetId, kind });
+  pumpVideoJobQueue();
 }
 
-function pumpTranscodeQueue() {
-  while (activeTranscodes < videoConcurrency && transcodeQueue.length) {
-    const assetId = transcodeQueue.shift()!;
-    transcodeQueued.delete(assetId);
-    activeTranscodes += 1;
-    void transcodeAsset(assetId)
-      .catch((error) => console.error(`Transcode failed for ${assetId}:`, error))
+function pumpVideoJobQueue() {
+  while (activeVideoJobs < videoConcurrency && videoJobQueue.length) {
+    const job = videoJobQueue.shift()!;
+    videoJobsQueued.delete(`${job.kind}:${job.assetId}`);
+    activeVideoJobs += 1;
+    const run = job.kind === "transcode" ? transcodeAsset(job.assetId) : upgradeVideoAsset(job.assetId);
+    void run
+      .catch((error) => console.error(`Video ${job.kind} failed for ${job.assetId}:`, error))
       .finally(() => {
-        activeTranscodes -= 1;
-        pumpTranscodeQueue();
+        activeVideoJobs -= 1;
+        pumpVideoJobQueue();
       });
   }
 }
@@ -1449,7 +1496,9 @@ async function transcodeAsset(assetId: string) {
   const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(assetId) as AssetRow | undefined;
   if (!row || row.media_type !== "video" || !row.video_path || !row.video_sd_path) return;
 
-  const sourcePath = path.join(path.dirname(path.join(dataDir, row.video_path)), VIDEO_SOURCE_NAME);
+  const dirAbs = path.dirname(path.join(dataDir, row.video_path));
+  const relDir = path.dirname(row.video_path);
+  const sourcePath = path.join(dirAbs, VIDEO_SOURCE_NAME);
   if (!(await fileExists(sourcePath))) {
     db.prepare("UPDATE assets SET status = 'failed' WHERE id = ?").run(assetId);
     return;
@@ -1457,14 +1506,24 @@ async function transcodeAsset(assetId: string) {
 
   try {
     const portrait = (row.height ?? 0) > (row.width ?? 0);
-    await runFfmpeg(transcodeArgs(sourcePath, path.join(dataDir, row.video_path), portrait ? 1080 : 1920, portrait ? 1920 : 1080,
-      { crf: videoHdCrf, maxrateKbps: videoHdMaxrateKbps, audioBitrate: "128k" }));
-    await runFfmpeg(transcodeArgs(sourcePath, path.join(dataDir, row.video_sd_path), portrait ? 480 : 854, portrait ? 854 : 480,
-      { crf: videoSdCrf, maxrateKbps: videoSdMaxrateKbps, audioBitrate: "96k" }));
+    const hlsDirAbs = path.join(dirAbs, "hls");
+    await buildHlsRendition(sourcePath, path.join(dataDir, row.video_path), path.join(hlsDirAbs, "v1080.m3u8"), "../file/video",
+      { boxW: portrait ? 1080 : 1920, boxH: portrait ? 1920 : 1080, crf: videoHdCrf, maxrateKbps: videoHdMaxrateKbps, audioBitrate: "128k" });
+    await buildHlsRendition(sourcePath, path.join(dataDir, row.video_sd_path), path.join(hlsDirAbs, "v480.m3u8"), "../file/video_sd",
+      { boxW: portrait ? 480 : 854, boxH: portrait ? 854 : 480, crf: videoSdCrf, maxrateKbps: videoSdMaxrateKbps, audioBitrate: "96k" });
+    await writeVideoMasterPlaylist(hlsDirAbs, [
+      { playlistName: "v1080.m3u8", mp4Abs: path.join(dataDir, row.video_path) },
+      { playlistName: "v480.m3u8", mp4Abs: path.join(dataDir, row.video_sd_path) }
+    ]);
+    // A missing storyboard only loses scrub previews, never the video itself.
+    const storyboard = await generateStoryboard(sourcePath, row.duration_ms ?? 0, dirAbs, relDir).catch((error) => {
+      console.error(`Storyboard generation failed for ${assetId}:`, error);
+      return null;
+    });
 
     const stat = await fs.stat(path.join(dataDir, row.video_path)).catch(() => null);
-    db.prepare("UPDATE assets SET status = 'ready', size_bytes = ? WHERE id = ?")
-      .run(stat?.size ?? row.size_bytes, assetId);
+    db.prepare("UPDATE assets SET status = 'ready', size_bytes = ?, hls_path = ?, storyboard_path = ?, storyboard_meta = ? WHERE id = ?")
+      .run(stat?.size ?? row.size_bytes, path.join(relDir, "hls", "master.m3u8"), storyboard?.relPath ?? null, storyboard?.meta ?? null, assetId);
     await fs.rm(sourcePath, { force: true }).catch(() => undefined);
   } catch (error) {
     db.prepare("UPDATE assets SET status = 'failed' WHERE id = ?").run(assetId);
@@ -1473,37 +1532,200 @@ async function transcodeAsset(assetId: string) {
 }
 
 /**
- * Build ffmpeg args for one H.264/AAC faststart MP4 that fits within boxW×boxH
- * (no upscaling). CRF sets the quality target; maxrate/bufsize cap the peak
- * bitrate so even high-motion footage streams smoothly. A keyframe every ~2s
- * keeps seeking (and the HD/SD quality toggle) responsive.
+ * Backfill the streaming extras (HLS playlists + scrub storyboard) for videos
+ * transcoded before those existed. The kept MP4 renditions are remuxed with
+ * `-c copy` (fast, no re-encode) into the same fragmented-MP4-plus-byte-range
+ * layout new uploads get. Failures are logged and retried on the next boot;
+ * the plain MP4s keep playing either way.
  */
-function transcodeArgs(
+async function upgradeVideoAsset(assetId: string) {
+  const row = db.prepare("SELECT * FROM assets WHERE id = ?").get(assetId) as AssetRow | undefined;
+  if (!row || row.media_type !== "video" || row.status !== "ready" || !row.video_path) return;
+
+  const dirAbs = path.dirname(path.join(dataDir, row.video_path));
+  const relDir = path.dirname(row.video_path);
+  const hlsDirAbs = path.join(dirAbs, "hls");
+  const hdAbs = path.join(dataDir, row.video_path);
+  if (!(await fileExists(hdAbs))) return;
+
+  let hlsRel = row.hls_path;
+  if (!hlsRel) {
+    const renditions = [{ playlistName: "v1080.m3u8", mp4Abs: hdAbs }];
+    await buildHlsRendition(hdAbs, hdAbs, path.join(hlsDirAbs, "v1080.m3u8"), "../file/video", null);
+    if (row.video_sd_path && (await fileExists(path.join(dataDir, row.video_sd_path)))) {
+      const sdAbs = path.join(dataDir, row.video_sd_path);
+      await buildHlsRendition(sdAbs, sdAbs, path.join(hlsDirAbs, "v480.m3u8"), "../file/video_sd", null);
+      renditions.push({ playlistName: "v480.m3u8", mp4Abs: sdAbs });
+    }
+    await writeVideoMasterPlaylist(hlsDirAbs, renditions);
+    hlsRel = path.join(relDir, "hls", "master.m3u8");
+  }
+
+  let storyboardPath = row.storyboard_path;
+  let storyboardMeta = row.storyboard_meta;
+  if (!storyboardMeta) {
+    const storyboard = await generateStoryboard(hdAbs, row.duration_ms ?? 0, dirAbs, relDir);
+    if (storyboard) {
+      storyboardPath = storyboard.relPath;
+      storyboardMeta = storyboard.meta;
+    }
+  }
+
+  db.prepare("UPDATE assets SET hls_path = ?, storyboard_path = ?, storyboard_meta = ? WHERE id = ?")
+    .run(hlsRel, storyboardPath, storyboardMeta, assetId);
+}
+
+/**
+ * Encode (or `-c copy` remux, when `encode` is null) one rendition as a single
+ * fragmented MP4 plus an HLS media playlist whose segments are byte ranges of
+ * that same file. ffmpeg's `single_file` fMP4 mode writes the init segment at
+ * offset 0 of the media file, so the output is simultaneously a valid
+ * progressive-download MP4 (used for the `video`/`original` variants and zip
+ * downloads) and the HLS media source — video bytes are stored exactly once.
+ * The playlist's segment URIs are rewritten to `mediaUri` (e.g. "../file/video")
+ * so they resolve to the existing authed/shared file endpoints, which already
+ * speak HTTP Range.
+ */
+async function buildHlsRendition(
   source: string,
-  out: string,
-  boxW: number,
-  boxH: number,
-  opts: { crf: number; maxrateKbps: number; audioBitrate: string }
-): string[] {
-  const scale = `scale=w=${boxW}:h=${boxH}:force_original_aspect_ratio=decrease:force_divisible_by=2`;
-  return [
-    "-y",
-    "-i", source,
-    "-vf", scale,
-    "-c:v", "libx264",
-    "-preset", videoPreset,
-    "-crf", String(opts.crf),
-    "-maxrate", `${opts.maxrateKbps}k`,
-    "-bufsize", `${opts.maxrateKbps * 2}k`,
-    "-profile:v", "high",
-    "-level", "4.1",
-    "-force_key_frames", "expr:gte(t,n_forced*2)",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", opts.audioBitrate,
-    "-movflags", "+faststart",
-    out
-  ];
+  mp4Abs: string,
+  playlistAbs: string,
+  mediaUri: string,
+  encode: { boxW: number; boxH: number; crf: number; maxrateKbps: number; audioBitrate: string } | null
+): Promise<void> {
+  const partSeg = `${mp4Abs}.part`;
+  const partPlaylist = `${playlistAbs}.part`;
+  await fs.mkdir(path.dirname(playlistAbs), { recursive: true });
+  try {
+    const args = ["-y", "-i", source];
+    if (encode) {
+      args.push(
+        "-vf", `scale=w=${encode.boxW}:h=${encode.boxH}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+        "-c:v", "libx264",
+        "-preset", videoPreset,
+        "-crf", String(encode.crf),
+        "-maxrate", `${encode.maxrateKbps}k`,
+        "-bufsize", `${encode.maxrateKbps * 2}k`,
+        "-profile:v", "high",
+        "-level", "4.1",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", encode.audioBitrate
+      );
+    } else {
+      args.push("-c", "copy");
+    }
+    args.push(
+      "-f", "hls",
+      "-hls_time", "4",
+      "-hls_playlist_type", "vod",
+      "-hls_flags", "single_file",
+      "-hls_segment_type", "fmp4",
+      "-hls_segment_filename", partSeg,
+      partPlaylist
+    );
+    await runFfmpeg(args);
+
+    // Point every media URI (segment lines and the EXT-X-MAP init reference)
+    // at the API file endpoint instead of the temp path ffmpeg wrote.
+    const rewritten = (await fs.readFile(partPlaylist, "utf8"))
+      .split(/\r?\n/)
+      .map((line) => {
+        if (line.startsWith("#EXT-X-MAP:")) return line.replace(/URI="[^"]*"/, `URI="${mediaUri}"`);
+        if (line && !line.startsWith("#")) return mediaUri;
+        return line;
+      })
+      .join("\n");
+
+    // The rename lands the fMP4 first (replacing the plain MP4 during
+    // upgrades); the playlist is only written once its media file is in place.
+    await fs.rename(partSeg, mp4Abs);
+    await fs.writeFile(playlistAbs, rewritten, "utf8");
+    await fs.rm(partPlaylist, { force: true }).catch(() => undefined);
+  } catch (error) {
+    await fs.rm(partSeg, { force: true }).catch(() => undefined);
+    await fs.rm(partPlaylist, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+/** Write the HLS master playlist advertising each rendition's bandwidth/resolution. */
+async function writeVideoMasterPlaylist(
+  hlsDirAbs: string,
+  renditions: Array<{ playlistName: string; mp4Abs: string }>
+): Promise<void> {
+  const lines = ["#EXTM3U", "#EXT-X-VERSION:7"];
+  for (const rendition of renditions) {
+    const probe = await probeVideo(rendition.mp4Abs);
+    const stat = await fs.stat(rendition.mp4Abs);
+    const durationSec = Math.max(probe.durationMs / 1000, 0.1);
+    const average = Math.max(1, Math.round((stat.size * 8) / durationSec));
+    const attrs = [`BANDWIDTH=${Math.round(average * 1.4)}`, `AVERAGE-BANDWIDTH=${average}`];
+    if (probe.width && probe.height) attrs.push(`RESOLUTION=${probe.width}x${probe.height}`);
+    const codecs = hlsCodecsAttr(probe);
+    if (codecs) attrs.push(`CODECS="${codecs}"`);
+    lines.push(`#EXT-X-STREAM-INF:${attrs.join(",")}`, rendition.playlistName);
+  }
+  await fs.writeFile(path.join(hlsDirAbs, "master.m3u8"), `${lines.join("\n")}\n`, "utf8");
+}
+
+/**
+ * RFC 6381 codec string for the master playlist, derived from the probed
+ * output. Returns null (attribute omitted — players then sniff the init
+ * segment) rather than guessing when the profile isn't one we know.
+ */
+function hlsCodecsAttr(probe: Awaited<ReturnType<typeof probeVideo>>): string | null {
+  if (probe.videoCodec !== "h264" || !probe.videoLevel) return null;
+  const profileHex = probe.videoProfile === "High" ? "6400" : probe.videoProfile === "Main" ? "4d40" : null;
+  if (!profileHex) return null;
+  const parts = [`avc1.${profileHex}${probe.videoLevel.toString(16).padStart(2, "0")}`];
+  if (probe.audioCodec === "aac") parts.push("mp4a.40.2");
+  else if (probe.audioCodec) return null;
+  return parts.join(",");
+}
+
+const STORYBOARD_TILE_WIDTH = 160;
+const STORYBOARD_COLS = 10;
+const STORYBOARD_MAX_FRAMES = 100;
+
+/**
+ * Render a sprite sheet of evenly spaced frames (YouTube-style scrub preview):
+ * one 160px-wide tile every `interval` seconds, at most 100 tiles, laid out in
+ * a 10-column grid. The layout metadata is stored on the asset row so the
+ * client can map a timeline position to a background offset.
+ */
+async function generateStoryboard(
+  source: string,
+  durationMs: number,
+  absoluteDir: string,
+  relativeDir: string
+): Promise<{ relPath: string; meta: string } | null> {
+  const durationSec = durationMs / 1000;
+  if (!Number.isFinite(durationSec) || durationSec < 1) return null;
+  const interval = Math.max(1, Math.ceil(durationSec / STORYBOARD_MAX_FRAMES));
+  const count = Math.min(STORYBOARD_MAX_FRAMES, Math.floor(durationSec / interval) + 1);
+  const cols = Math.min(STORYBOARD_COLS, count);
+  const rows = Math.ceil(count / cols);
+  const outAbs = path.join(absoluteDir, "storyboard.jpg");
+  await runFfmpeg([
+    "-y", "-i", source,
+    "-vf", `fps=1/${interval},scale=${STORYBOARD_TILE_WIDTH}:-1,tile=${cols}x${rows}`,
+    "-frames:v", "1",
+    "-q:v", "5",
+    outAbs
+  ]);
+  const info = await sharp(outAbs).metadata();
+  if (!info.width || !info.height) return null;
+  const meta = JSON.stringify({
+    interval,
+    cols,
+    rows,
+    count,
+    tileWidth: Math.round(info.width / cols),
+    tileHeight: Math.round(info.height / rows)
+  });
+  return { relPath: path.join(relativeDir, "storyboard.jpg"), meta };
 }
 
 /** On boot, re-enqueue videos still marked `processing`; fail any whose source is gone. */
@@ -1517,12 +1739,23 @@ function resumeVideoProcessing() {
     }
     const sourcePath = path.join(path.dirname(path.join(dataDir, row.video_path)), VIDEO_SOURCE_NAME);
     if (existsSync(sourcePath)) {
-      enqueueTranscode(row.id);
+      enqueueVideoJob("transcode", row.id);
     } else {
       db.prepare("UPDATE assets SET status = 'failed' WHERE id = ?").run(row.id);
     }
   }
   if (rows.length) console.log(`Resumed video processing for ${rows.length} asset(s).`);
+}
+
+/** Queue the HLS/storyboard backfill for ready videos that predate those features. */
+function enqueueVideoUpgrades() {
+  const rows = db.prepare(`
+    SELECT id FROM assets
+    WHERE media_type = 'video' AND status = 'ready'
+      AND (hls_path IS NULL OR (storyboard_meta IS NULL AND duration_ms >= 1000))
+  `).all() as Array<{ id: string }>;
+  for (const row of rows) enqueueVideoJob("upgrade", row.id);
+  if (rows.length) console.log(`Queued streaming upgrade for ${rows.length} existing video(s).`);
 }
 
 function runFfmpeg(args: string[]): Promise<void> {
@@ -1541,7 +1774,16 @@ function runFfmpeg(args: string[]): Promise<void> {
   });
 }
 
-function probeVideo(filePath: string): Promise<{ durationMs: number; width: number | null; height: number | null; createdAt: string | null }> {
+function probeVideo(filePath: string): Promise<{
+  durationMs: number;
+  width: number | null;
+  height: number | null;
+  createdAt: string | null;
+  videoCodec: string | null;
+  videoProfile: string | null;
+  videoLevel: number | null;
+  audioCodec: string | null;
+}> {
   return new Promise((resolve, reject) => {
     const child = spawn(ffprobePath, [
       "-v", "error",
@@ -1561,9 +1803,10 @@ function probeVideo(filePath: string): Promise<{ durationMs: number; width: numb
       try {
         const data = JSON.parse(stdout) as {
           format?: { duration?: string; tags?: Record<string, string> };
-          streams?: Array<{ codec_type?: string; width?: number; height?: number; tags?: Record<string, string> }>;
+          streams?: Array<{ codec_type?: string; codec_name?: string; profile?: string; level?: number; width?: number; height?: number; tags?: Record<string, string> }>;
         };
         const video = data.streams?.find((s) => s.codec_type === "video");
+        const audio = data.streams?.find((s) => s.codec_type === "audio");
         const durationSec = Number(data.format?.duration ?? 0);
         const creation = data.format?.tags?.creation_time ?? video?.tags?.creation_time;
         const created = creation ? new Date(creation) : null;
@@ -1571,7 +1814,11 @@ function probeVideo(filePath: string): Promise<{ durationMs: number; width: numb
           durationMs: Number.isFinite(durationSec) ? Math.round(durationSec * 1000) : 0,
           width: video?.width ?? null,
           height: video?.height ?? null,
-          createdAt: created && !isNaN(created.getTime()) ? created.toISOString() : null
+          createdAt: created && !isNaN(created.getTime()) ? created.toISOString() : null,
+          videoCodec: video?.codec_name ?? null,
+          videoProfile: video?.profile ?? null,
+          videoLevel: typeof video?.level === "number" && video.level > 0 ? video.level : null,
+          audioCodec: audio?.codec_name ?? null
         });
       } catch (error) {
         reject(error);
@@ -1750,6 +1997,15 @@ function toPublicAsset(row: AssetRow, shareToken?: string, inSharedAlbum = false
   const base = shareToken ? `/api/share/${shareToken}/file/${row.id}` : `/api/assets/${row.id}/file`;
   const isVideo = row.media_type === "video";
   const ready = isVideo && row.status === "ready";
+  const streamReady = ready && Boolean(row.hls_path);
+  let storyboard: { interval: number; cols: number; rows: number; count: number; tileWidth: number; tileHeight: number } | null = null;
+  if (row.storyboard_path && row.storyboard_meta) {
+    try {
+      storyboard = JSON.parse(row.storyboard_meta);
+    } catch {
+      storyboard = null;
+    }
+  }
   return {
     id: row.id,
     originalName: row.original_name,
@@ -1766,12 +2022,17 @@ function toPublicAsset(row: AssetRow, shareToken?: string, inSharedAlbum = false
     mediaType: isVideo ? "video" : "image",
     status: row.status ?? "ready",
     durationMs: row.duration_ms ?? null,
+    storyboard,
     urls: {
       thumb: `${base}/thumb`,
       preview: `${base}/preview`,
       original: shareToken ? null : `${base}/original`,
       video: ready ? `${base}/video` : null,
-      videoSd: ready ? `${base}/video_sd` : null
+      videoSd: ready ? `${base}/video_sd` : null,
+      hls: streamReady
+        ? (shareToken ? `/api/share/${shareToken}/assets/${row.id}/hls/master.m3u8` : `/api/assets/${row.id}/hls/master.m3u8`)
+        : null,
+      storyboard: storyboard ? `${base}/storyboard` : null
     }
   };
 }
