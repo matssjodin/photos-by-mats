@@ -1608,17 +1608,33 @@ function VideoPlayer({ asset }: { asset: Asset }) {
       if (!resume || resume.playing) void video.play().catch(() => undefined);
     }, { once: true });
 
+    // If a streaming engine produces no data at all (a browser that claims
+    // HLS/MSE support but never opens the stream, a dead hls.js chunk, …),
+    // the play button would silently do nothing — drop to progressive MP4.
+    let watchdog: number | undefined;
+    function armStallWatchdog() {
+      watchdog = window.setTimeout(() => {
+        if (!cancelled && video!.readyState === 0 && video!.buffered.length === 0) setUseMp4(true);
+      }, 6000);
+    }
+
     async function setup() {
       const hlsUrl = asset.urls.hls;
       if (hlsUrl && !useMp4) {
         // hls.js (MSE) first: some browsers claim canPlayType("…mpegurl")
         // without reliably streaming it. Native HLS is the fallback for
         // browsers without MSE (iOS Safari), where it works properly.
-        const HlsCtor = (await import("hls.js")).default;
+        let HlsCtor: typeof import("hls.js").default | null = null;
+        try {
+          HlsCtor = (await import("hls.js")).default;
+        } catch {
+          HlsCtor = null;
+        }
         if (cancelled) return;
-        if (HlsCtor.isSupported()) {
+        if (HlsCtor?.isSupported()) {
           hls = new HlsCtor({ capLevelToPlayerSize: true });
           hlsRef.current = hls;
+          const recovered = { network: false, media: false };
           hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
             if (!cancelled && hls) setLevels(hls.levels.map((level) => level.height));
           });
@@ -1627,19 +1643,27 @@ function VideoPlayer({ asset }: { asset: Asset }) {
           });
           hls.on(HlsCtor.Events.ERROR, (_event, data) => {
             if (!data.fatal || cancelled) return;
-            // One shot at recovery, then drop to the plain MP4 renditions.
-            if (data.type === "networkError") hls?.startLoad();
-            else if (data.type === "mediaError") hls?.recoverMediaError();
-            else setUseMp4(true);
+            // One shot at recovery per error type, then drop to plain MP4.
+            if (data.type === "networkError" && !recovered.network) {
+              recovered.network = true;
+              hls?.startLoad();
+            } else if (data.type === "mediaError" && !recovered.media) {
+              recovered.media = true;
+              hls?.recoverMediaError();
+            } else {
+              setUseMp4(true);
+            }
           });
           hls.loadSource(hlsUrl);
           hls.attachMedia(video!);
           setEngine("hls");
+          armStallWatchdog();
           return;
         }
         if (video!.canPlayType("application/vnd.apple.mpegurl")) {
           setEngine("native");
           video!.src = hlsUrl;
+          armStallWatchdog();
           return;
         }
       }
@@ -1651,6 +1675,7 @@ function VideoPlayer({ asset }: { asset: Asset }) {
 
     return () => {
       cancelled = true;
+      if (watchdog) window.clearTimeout(watchdog);
       if (hls) hls.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
       video.removeAttribute("src");

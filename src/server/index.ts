@@ -1143,9 +1143,13 @@ function securityHeaders(_req: express.Request, res: express.Response, next: exp
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "same-origin");
+  // media-src/worker-src must allow blob:. MSE playback (hls.js) attaches a
+  // blob: URL to the <video> element and spawns its demuxer worker from a
+  // blob: — default-src 'self' alone silently blocks both, leaving a video
+  // that never loads in production while working on the CSP-less Vite dev server.
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
   );
   if (isProduction) {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
@@ -1600,7 +1604,10 @@ async function buildHlsRendition(
     const args = ["-y", "-i", source];
     if (encode) {
       args.push(
-        "-vf", `scale=w=${encode.boxW}:h=${encode.boxH}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+        // min() caps each axis at the source size so smaller videos are never
+        // upscaled (force_original_aspect_ratio=decrease alone would enlarge
+        // them to the box, inflating bitrate for e.g. 720p phone footage).
+        "-vf", `scale=w='min(${encode.boxW},iw)':h='min(${encode.boxH},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`,
         "-c:v", "libx264",
         "-preset", videoPreset,
         "-crf", String(encode.crf),
