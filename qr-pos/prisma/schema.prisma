@@ -1,0 +1,331 @@
+// Prisma schema for the QR-based POS MVP.
+//
+// Design notes
+// ------------
+// * Core flow: Venue -> Zone -> Place -> Session -> Order -> OrderItem,
+//   and every Order is split into one Ticket per Station.
+// * Append-only accounting: Order, OrderItem and Payment are treated as
+//   immutable once written. We never UPDATE their financial fields and we
+//   never hard-DELETE them. Corrections are expressed as new rows in the
+//   `Cancellation` table (a "makulering"/void), so a certified journal can be
+//   layered on later without a rewrite.
+//   - The one mutable column we do allow on Order/Ticket is `status`, which is
+//     operational workflow state (RECEIVED -> ... -> DELIVERED), not an
+//     accounting fact. Money-relevant data (items, prices, payments) is frozen.
+// * Prices are copied into OrderItem.unitPriceCents at order time so later
+//   menu edits never change an existing bill.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum ZoneType {
+  POOL // lounge chairs move during the day -> guest confirms delivery position
+  OUTDOOR
+  INDOOR
+}
+
+enum StationType {
+  BAR
+  KITCHEN
+  NO_PREP // served directly, no ticket routed to a prep station
+}
+
+enum SessionStatus {
+  OPEN
+  CLOSED
+}
+
+enum OrderStatus {
+  RECEIVED
+  IN_PROGRESS
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+enum TicketStatus {
+  RECEIVED
+  IN_PROGRESS
+  READY
+  DELIVERED
+}
+
+enum PaymentMethod {
+  MOCK // MVP mock provider; SWISH/STRIPE/CARD/CASH plug in later
+  SWISH
+  STRIPE
+  CARD
+  CASH
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum StaffRole {
+  BARTENDER
+  KITCHEN
+  RUNNER
+  MANAGER
+}
+
+// What a Cancellation row voids. Keeps corrections append-only.
+enum CancellationScope {
+  ORDER_ITEM
+  ORDER
+}
+
+// ---------------------------------------------------------------------------
+// Venue / topology
+// ---------------------------------------------------------------------------
+
+model Venue {
+  id       String @id @default(cuid())
+  name     String
+  timezone String @default("Europe/Stockholm")
+
+  zones      Zone[]
+  places     Place[]
+  stations   Station[]
+  categories MenuCategory[]
+  menuItems  MenuItem[]
+  staff      StaffUser[]
+
+  createdAt DateTime @default(now())
+}
+
+model Zone {
+  id      String   @id @default(cuid())
+  venueId String
+  venue   Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  name    String // "Poolområde A", "Uteservering", "Matsal"
+  type    ZoneType // POOL | OUTDOOR | INDOOR — drives guest flow & runner grouping
+
+  places Place[]
+
+  createdAt DateTime @default(now())
+
+  @@index([venueId])
+}
+
+model Place {
+  id      String @id @default(cuid())
+  venueId String
+  venue   Venue  @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  zoneId  String
+  zone    Zone   @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+
+  label  String // "Solstol 14", "Bord B3"
+  token  String  @unique // cryptographically random, URL-safe — NEVER sequential
+  active Boolean @default(true) // staff can take a place offline
+
+  sessions Session[]
+
+  createdAt DateTime @default(now())
+
+  @@index([venueId])
+  @@index([zoneId])
+}
+
+model Station {
+  id      String      @id @default(cuid())
+  venueId String
+  venue   Venue       @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  name    String
+  type    StationType // BAR | KITCHEN | NO_PREP
+
+  menuItems MenuItem[]
+  tickets   Ticket[]
+
+  createdAt DateTime @default(now())
+
+  @@index([venueId])
+}
+
+// ---------------------------------------------------------------------------
+// Menu
+// ---------------------------------------------------------------------------
+
+model MenuCategory {
+  id        String @id @default(cuid())
+  venueId   String
+  venue     Venue  @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  name      String
+  sortOrder Int    @default(0)
+
+  items MenuItem[]
+
+  createdAt DateTime @default(now())
+
+  @@index([venueId])
+}
+
+model MenuItem {
+  id         String       @id @default(cuid())
+  venueId    String
+  venue      Venue        @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  categoryId String
+  category   MenuCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  stationId  String
+  station    Station      @relation(fields: [stationId], references: [id])
+
+  name        String
+  description String?
+  imageUrl    String?
+  priceCents  Int
+
+  available        Boolean @default(true) // the "86" toggle
+  requiresAgeCheck Boolean @default(false) // alcohol -> forces staff sign-off on delivery
+
+  orderItems OrderItem[]
+
+  createdAt DateTime @default(now())
+
+  @@index([venueId])
+  @@index([categoryId])
+  @@index([stationId])
+}
+
+// ---------------------------------------------------------------------------
+// Sessions / orders / tickets  (append-only for money-relevant rows)
+// ---------------------------------------------------------------------------
+
+model Session {
+  id      String        @id @default(cuid())
+  placeId String
+  place   Place         @relation(fields: [placeId], references: [id])
+  status  SessionStatus @default(OPEN)
+
+  // For POOL zones the guest confirms/adjusts their position within the zone;
+  // shown to the runner. Null for OUTDOOR/INDOOR.
+  deliveryLocation String?
+
+  openedAt DateTime  @default(now())
+  closedAt DateTime?
+
+  orders   Order[]
+  payments Payment[]
+
+  // Enforce "at most one OPEN session per place" via a partial unique index
+  // (added in a migration): CREATE UNIQUE INDEX ... WHERE status = 'OPEN'.
+  @@index([placeId])
+  @@index([placeId, status])
+}
+
+model Order {
+  id        String      @id @default(cuid())
+  sessionId String
+  session   Session     @relation(fields: [sessionId], references: [id])
+  status    OrderStatus @default(RECEIVED) // rolled up from its tickets
+  note      String? // free text from the guest
+
+  items   OrderItem[]
+  tickets Ticket[]
+
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+}
+
+// Immutable line item. Price is copied in at order time.
+model OrderItem {
+  id         String   @id @default(cuid())
+  orderId    String
+  order      Order    @relation(fields: [orderId], references: [id])
+  menuItemId String
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id])
+
+  quantity       Int
+  unitPriceCents Int // snapshot — never re-read from MenuItem
+  note           String?
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+}
+
+// An order split per station. Order with beer + fries => two tickets.
+model Ticket {
+  id        String       @id @default(cuid())
+  orderId   String
+  order     Order        @relation(fields: [orderId], references: [id])
+  stationId String
+  station   Station      @relation(fields: [stationId], references: [id])
+  status    TicketStatus @default(RECEIVED)
+
+  claimedById String? // which StaffUser took it
+  claimedBy   StaffUser? @relation(fields: [claimedById], references: [id])
+  claimedAt   DateTime?
+  readyAt     DateTime?
+  deliveredAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([stationId, status])
+}
+
+model Payment {
+  id            String        @id @default(cuid())
+  sessionId     String
+  session       Session       @relation(fields: [sessionId], references: [id])
+  amountCents   Int
+  method        PaymentMethod @default(MOCK)
+  status        PaymentStatus @default(PENDING)
+  providerRef   String? // opaque reference from the payment provider
+  createdAt     DateTime      @default(now())
+
+  @@index([sessionId])
+}
+
+// Append-only correction record. Instead of UPDATE/DELETE on an OrderItem or
+// Order, staff write a Cancellation row. This is the seed of the future
+// journal required by cash-register regulation.
+model Cancellation {
+  id      String            @id @default(cuid())
+  scope   CancellationScope
+  orderId String? // set when scope = ORDER
+  itemId  String? // set when scope = ORDER_ITEM
+
+  amountCents Int // value voided (positive), for the ledger
+  reason      String?
+  voidedById  String? // StaffUser who authorised the void
+  voidedBy    StaffUser? @relation(fields: [voidedById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([itemId])
+}
+
+// ---------------------------------------------------------------------------
+// Staff
+// ---------------------------------------------------------------------------
+
+model StaffUser {
+  id      String    @id @default(cuid())
+  venueId String
+  venue   Venue     @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  name    String
+  role    StaffRole
+  pinHash String // hashed PIN (never store the raw PIN)
+
+  claimedTickets Ticket[]
+  cancellations  Cancellation[]
+
+  createdAt DateTime @default(now())
+
+  @@index([venueId])
+}
