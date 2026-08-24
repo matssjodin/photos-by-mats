@@ -798,6 +798,7 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
               activeAlbum={activeAlbum}
               assets={visibleAssets}
               busy={busy}
+              groupByDate={!activeAlbum}
               onAddExisting={openAddModal}
               onBack={() => setActiveAlbum(null)}
               onEditAlbum={() => setEditAlbumOpen(true)}
@@ -1194,6 +1195,7 @@ function SharedAlbum({
           activeAlbum={null}
           assets={assets}
           busy={false}
+          groupByDate={false}
           onAddExisting={() => undefined}
           onBack={() => undefined}
           onSelect={setSelected}
@@ -2309,6 +2311,7 @@ function LibraryView({
   activeAlbum,
   assets,
   busy,
+  groupByDate = true,
   onAddExisting,
   onBack,
   onEditAlbum = () => {},
@@ -2326,6 +2329,8 @@ function LibraryView({
   activeAlbum: Album | null;
   assets: Asset[];
   busy: boolean;
+  /** Group tiles under date headings (library). Albums render one flat grid without dates. */
+  groupByDate?: boolean;
   onAddExisting: () => void;
   onBack: () => void;
   onEditAlbum?: () => void;
@@ -2410,9 +2415,9 @@ function LibraryView({
         {activeAlbum && (
           <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
         )}
-        {groupAssets(assets).map((group) => (
+        {(groupByDate ? groupAssets(assets) : [{ label: "", assets }]).map((group) => (
           <div className="date-group" key={group.label}>
-            <h2>{group.label}</h2>
+            {group.label && <h2>{group.label}</h2>}
             <div className="photo-grid">
               {group.assets.map((asset) => {
                 const isSelected = selectedIds.has(asset.id);
