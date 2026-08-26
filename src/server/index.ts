@@ -31,6 +31,8 @@ const sessionTtlMs = 1000 * 60 * 60 * 24 * 30;
 const maxUploadFiles = Number(process.env.MAX_UPLOAD_FILES ?? 500);
 const maxUploadFileSizeMb = Number(process.env.MAX_UPLOAD_FILE_SIZE_MB ?? 120);
 const maxUploadVideoSizeMb = Number(process.env.MAX_UPLOAD_VIDEO_SIZE_MB ?? 2048);
+// Per-photo caption shown in the viewer (and on shared albums).
+const maxDescriptionLength = 2000;
 const isProduction = process.env.NODE_ENV === "production";
 const appOrigin = process.env.APP_ORIGIN?.replace(/\/$/, "");
 const ingestConcurrency = Math.max(1, Number(process.env.INGEST_CONCURRENCY ?? 3));
@@ -98,6 +100,7 @@ type AssetRow = {
   hls_path: string | null;
   storyboard_path: string | null;
   storyboard_meta: string | null;
+  description: string | null;
 };
 
 type AlbumRow = {
@@ -219,6 +222,10 @@ ensureColumn("assets", "video_sd_path", "TEXT");
 ensureColumn("assets", "hls_path", "TEXT");
 ensureColumn("assets", "storyboard_path", "TEXT");
 ensureColumn("assets", "storyboard_meta", "TEXT");
+ensureColumn("assets", "description", "TEXT");
+// Manual album ordering: lower positions come first; new members append at the end.
+ensureColumn("album_assets", "position", "INTEGER");
+backfillAlbumPositions();
 // Photos trashed before this column existed start their retention clock now.
 db.prepare("UPDATE assets SET trashed_at = ? WHERE trashed = 1 AND trashed_at IS NULL").run(new Date().toISOString());
 db.exec(`
@@ -254,7 +261,7 @@ app.get("/api/share/:token", (req, res) => {
     SELECT assets.* FROM album_assets
     JOIN assets ON assets.id = album_assets.asset_id
     WHERE album_assets.album_id = ? AND assets.trashed = 0
-    ORDER BY assets.taken_at ASC, assets.original_name ASC
+    ORDER BY album_assets.position ASC, assets.taken_at ASC, assets.original_name ASC
   `).all(album.id) as AssetRow[];
 
   res.json({
@@ -596,22 +603,38 @@ app.patch("/api/assets/:id", (req, res) => {
     return;
   }
 
-  const { favorite, archived, trashed } = req.body as {
+  const { favorite, archived, trashed, description } = req.body as {
     favorite?: boolean;
     archived?: boolean;
     trashed?: boolean;
+    description?: unknown;
   };
+
+  let nextDescription = asset.description;
+  if (description !== undefined) {
+    if (typeof description !== "string") {
+      res.status(400).json({ error: "Description must be text." });
+      return;
+    }
+    const trimmed = description.trim();
+    if (trimmed.length > maxDescriptionLength) {
+      res.status(400).json({ error: `Description is too long (max ${maxDescriptionLength} characters).` });
+      return;
+    }
+    nextDescription = trimmed || null;
+  }
 
   const nextTrashed = typeof trashed === "boolean" ? Number(trashed) : asset.trashed;
   db.prepare(`
     UPDATE assets
-    SET favorite = ?, archived = ?, trashed = ?, trashed_at = ?
+    SET favorite = ?, archived = ?, trashed = ?, trashed_at = ?, description = ?
     WHERE id = ?
   `).run(
     typeof favorite === "boolean" ? Number(favorite) : asset.favorite,
     typeof archived === "boolean" ? Number(archived) : asset.archived,
     nextTrashed,
     nextTrashed ? (asset.trashed_at ?? new Date().toISOString()) : null,
+    nextDescription,
     asset.id
   );
 
@@ -770,7 +793,7 @@ app.post("/api/albums/:id/upload", upload.array("photos", maxUploadFiles), async
     const created: ReturnType<typeof toPublicAsset>[] = [];
     const duplicates: ReturnType<typeof toPublicAsset>[] = [];
     const errors: Array<{ name: string; error: string }> = [];
-    const insertAlbumAsset = db.prepare("INSERT OR IGNORE INTO album_assets (album_id, asset_id, added_at) VALUES (?, ?, ?)");
+    const insertAlbumAsset = db.prepare(insertAlbumAssetSql);
     outcomes.forEach((outcome, index) => {
       if (!outcome.ok) {
         errors.push({ name: files[index].originalname, error: outcome.error.message });
@@ -778,7 +801,7 @@ app.post("/api/albums/:id/upload", upload.array("photos", maxUploadFiles), async
       }
       try {
         // Duplicates still get linked: re-sharing an existing photo into an album is the intent.
-        insertAlbumAsset.run(albumId, outcome.value.asset.id, new Date().toISOString());
+        insertAlbumAsset.run(albumId, outcome.value.asset.id, new Date().toISOString(), albumId);
         if (outcome.value.duplicate) duplicates.push(outcome.value.asset);
         else created.push(outcome.value.asset);
       } catch (error) {
@@ -811,10 +834,60 @@ app.get("/api/albums/:id/assets", (req, res) => {
     SELECT assets.* FROM album_assets
     JOIN assets ON assets.id = album_assets.asset_id
     WHERE album_assets.album_id = ? AND assets.trashed = 0
-    ORDER BY assets.taken_at ASC, assets.original_name ASC
+    ORDER BY album_assets.position ASC, assets.taken_at ASC, assets.original_name ASC
   `).all(albumId) as AssetRow[];
   const sharedIds = sharedAlbumAssetIds(user.id);
   res.json({ assets: assets.map((asset) => toPublicAsset(asset, undefined, sharedIds.has(asset.id))) });
+});
+
+/**
+ * Persists a manual order for the album. `assetIds` lists the members in
+ * their new order; members it omits (e.g. trashed photos the client can't
+ * see) keep their relative order after the listed ones.
+ */
+app.put("/api/albums/:id/order", (req, res) => {
+  const user = authUser(req);
+  const albumId = String(req.params.id);
+  const album = db.prepare("SELECT * FROM albums WHERE id = ? AND user_id = ?").get(albumId, user.id);
+  if (!album) {
+    res.status(404).json({ error: "Album not found." });
+    return;
+  }
+  const { assetIds } = req.body as { assetIds?: unknown };
+  if (!Array.isArray(assetIds) || !assetIds.every((id) => typeof id === "string")) {
+    res.status(400).json({ error: "assetIds must be a list of asset ids." });
+    return;
+  }
+
+  const members = db.prepare(`
+    SELECT aa.asset_id AS id FROM album_assets aa
+    JOIN assets ON assets.id = aa.asset_id
+    WHERE aa.album_id = ?
+    ORDER BY aa.position ASC, assets.taken_at ASC, assets.original_name ASC
+  `).all(albumId) as Array<{ id: string }>;
+  const memberIds = new Set(members.map((row) => row.id));
+  const ordered: string[] = [];
+  const placed = new Set<string>();
+  for (const id of assetIds as string[]) {
+    if (memberIds.has(id) && !placed.has(id)) {
+      placed.add(id);
+      ordered.push(id);
+    }
+  }
+  for (const row of members) {
+    if (!placed.has(row.id)) ordered.push(row.id);
+  }
+
+  const update = db.prepare("UPDATE album_assets SET position = ? WHERE album_id = ? AND asset_id = ?");
+  db.exec("BEGIN");
+  try {
+    ordered.forEach((id, index) => update.run(index, albumId, id));
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  res.json({ ok: true, assetIds: ordered });
 });
 
 app.post("/api/albums/:id/assets", (req, res) => {
@@ -833,12 +906,12 @@ app.post("/api/albums/:id/assets", (req, res) => {
     return;
   }
 
-  const insert = db.prepare("INSERT OR IGNORE INTO album_assets (album_id, asset_id, added_at) VALUES (?, ?, ?)");
+  const insert = db.prepare(insertAlbumAssetSql);
   let added = 0;
   for (const id of ids) {
     const asset = findOwnedAsset(String(id), user);
     if (asset && !asset.trashed) {
-      insert.run(albumId, asset.id, new Date().toISOString());
+      insert.run(albumId, asset.id, new Date().toISOString(), albumId);
       added += 1;
     }
   }
@@ -1075,6 +1148,44 @@ function upsertAdmin(email: string, password: string, name: string) {
     credentials.salt,
     new Date().toISOString()
   );
+}
+
+/** Appends a member at the end of the album's manual order (INSERT OR IGNORE keeps existing rows). */
+const insertAlbumAssetSql = `
+  INSERT OR IGNORE INTO album_assets (album_id, asset_id, added_at, position)
+  VALUES (?, ?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM album_assets WHERE album_id = ?))
+`;
+
+/**
+ * One-time migration for albums created before manual ordering existed:
+ * members without a position get one in the old display order (date, name),
+ * after any that already have a position.
+ */
+function backfillAlbumPositions() {
+  const albumIds = db.prepare("SELECT DISTINCT album_id FROM album_assets WHERE position IS NULL").all() as Array<{ album_id: string }>;
+  if (!albumIds.length) return;
+  const pending = db.prepare(`
+    SELECT aa.asset_id FROM album_assets aa
+    JOIN assets ON assets.id = aa.asset_id
+    WHERE aa.album_id = ? AND aa.position IS NULL
+    ORDER BY assets.taken_at ASC, assets.original_name ASC
+  `);
+  const maxPosition = db.prepare("SELECT COALESCE(MAX(position), -1) AS max FROM album_assets WHERE album_id = ?");
+  const update = db.prepare("UPDATE album_assets SET position = ? WHERE album_id = ? AND asset_id = ?");
+  db.exec("BEGIN");
+  try {
+    for (const { album_id } of albumIds) {
+      let next = (maxPosition.get(album_id) as { max: number }).max + 1;
+      for (const { asset_id } of pending.all(album_id) as Array<{ asset_id: string }>) {
+        update.run(next, album_id, asset_id);
+        next += 1;
+      }
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function ensureColumn(table: string, column: string, definition: string) {
@@ -2029,6 +2140,7 @@ function toPublicAsset(row: AssetRow, shareToken?: string, inSharedAlbum = false
     mediaType: isVideo ? "video" : "image",
     status: row.status ?? "ready",
     durationMs: row.duration_ms ?? null,
+    description: row.description ?? "",
     storyboard,
     urls: {
       thumb: `${base}/thumb`,

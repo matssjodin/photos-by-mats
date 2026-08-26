@@ -244,6 +244,75 @@ test("album create, add asset, share, and public access work end to end", async 
   assert.equal(bogus.status, 404);
 });
 
+test("asset descriptions save, validate, survive other patches, and show on shared albums", async () => {
+  const jsonHeaders = authedHeaders({ "Content-Type": "application/json" });
+  const patch = async (body: unknown) => fetch(`${baseUrl}/api/assets/${assetId}`, { method: "PATCH", headers: jsonHeaders, body: JSON.stringify(body) });
+
+  const saved = await patch({ description: "  Grandma's garden, summer 2024  " });
+  assert.equal(saved.status, 200);
+  assert.equal((await saved.json() as { asset: { description: string } }).asset.description, "Grandma's garden, summer 2024", "description is trimmed");
+
+  assert.equal((await patch({ description: "x".repeat(2001) })).status, 400, "over-long descriptions are rejected");
+  assert.equal((await patch({ description: 42 })).status, 400, "non-text descriptions are rejected");
+
+  // Patching other fields leaves the description alone.
+  const favorite = await patch({ favorite: true });
+  assert.equal((await favorite.json() as { asset: { description: string } }).asset.description, "Grandma's garden, summer 2024");
+
+  // Visible to anyone with a share link.
+  const album = (await (await fetch(`${baseUrl}/api/albums`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ title: "Captioned" })
+  })).json() as { album: { id: string } }).album;
+  await fetch(`${baseUrl}/api/albums/${album.id}/assets`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ assetIds: [assetId] }) });
+  const share = await (await fetch(`${baseUrl}/api/albums/${album.id}/share`, { method: "POST", headers: authedHeaders() })).json() as { album: { shareToken: string } };
+  const shared = await (await fetch(`${baseUrl}/api/share/${share.album.shareToken}`)).json() as { assets: Array<{ description: string }> };
+  assert.equal(shared.assets[0].description, "Grandma's garden, summer 2024");
+
+  // Empty text clears it.
+  const cleared = await patch({ description: "   " });
+  assert.equal((await cleared.json() as { asset: { description: string } }).asset.description, "");
+});
+
+test("album order is manual: members append, PUT /order rearranges, listings honour it", async () => {
+  const jsonHeaders = authedHeaders({ "Content-Type": "application/json" });
+  const ids = [assetId];
+  for (const background of [{ r: 10, g: 20, b: 30 }, { r: 40, g: 50, b: 60 }]) {
+    const form = new FormData();
+    form.append("photos", new Blob([new Uint8Array(await makePng(background))], { type: "image/png" }), `order-${ids.length}.png`);
+    const response = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+    assert.equal(response.status, 201);
+    ids.push((await response.json() as { assets: Array<{ id: string }> }).assets[0].id);
+  }
+  const [a, b, c] = ids;
+
+  const album = (await (await fetch(`${baseUrl}/api/albums`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ title: "Ordered" })
+  })).json() as { album: { id: string } }).album;
+  // Add in a deliberately non-chronological order: members append in the order given.
+  await fetch(`${baseUrl}/api/albums/${album.id}/assets`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ assetIds: [c, a] }) });
+  await fetch(`${baseUrl}/api/albums/${album.id}/assets`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ assetIds: [b] }) });
+  const listIds = async () => (await (await fetch(`${baseUrl}/api/albums/${album.id}/assets`, { headers: authedHeaders() })).json() as { assets: Array<{ id: string }> }).assets.map((asset) => asset.id);
+  assert.deepEqual(await listIds(), [c, a, b]);
+
+  const reorder = await fetch(`${baseUrl}/api/albums/${album.id}/order`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ assetIds: [b, c, a] }) });
+  assert.equal(reorder.status, 200);
+  assert.deepEqual((await reorder.json() as { assetIds: string[] }).assetIds, [b, c, a]);
+  assert.deepEqual(await listIds(), [b, c, a]);
+
+  // Shared listings use the same order.
+  const share = await (await fetch(`${baseUrl}/api/albums/${album.id}/share`, { method: "POST", headers: authedHeaders() })).json() as { album: { shareToken: string } };
+  const shared = await (await fetch(`${baseUrl}/api/share/${share.album.shareToken}`)).json() as { assets: Array<{ id: string }> };
+  assert.deepEqual(shared.assets.map((asset) => asset.id), [b, c, a]);
+
+  // Partial lists go first; unknown ids are ignored; the rest keep their relative order.
+  const partial = await fetch(`${baseUrl}/api/albums/${album.id}/order`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ assetIds: ["nope", a] }) });
+  assert.equal(partial.status, 200);
+  assert.deepEqual(await listIds(), [a, b, c]);
+
+  assert.equal((await fetch(`${baseUrl}/api/albums/${album.id}/order`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ assetIds: "a,b" }) })).status, 400);
+  assert.equal((await fetch(`${baseUrl}/api/albums/does-not-exist/order`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ assetIds: [a] }) })).status, 404);
+});
+
 test("inSharedAlbum tracks membership and revoking a share keeps the photos", async () => {
   // Upload a dedicated asset and confirm it is not flagged as shared yet.
   const png = await makePng({ r: 33, g: 99, b: 150 });

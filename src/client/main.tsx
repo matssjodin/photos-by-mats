@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import {
   Archive,
   AlertTriangle,
+  ArrowUpDown,
   Camera,
   Check,
   ChevronLeft,
@@ -73,6 +74,8 @@ type Asset = {
   mediaType: "image" | "video";
   status: "processing" | "ready" | "failed";
   durationMs: number | null;
+  /** Free-text caption; empty when unset. Shown in the viewer and on shared albums. */
+  description: string;
   storyboard: Storyboard | null;
   urls: {
     thumb: string;
@@ -84,6 +87,9 @@ type Asset = {
     storyboard: string | null;
   };
 };
+
+/** Fields the viewer can change on a single asset via PATCH /api/assets/:id. */
+type AssetPatch = Partial<Pick<Asset, "favorite" | "archived" | "trashed" | "description">>;
 
 type Album = {
   id: string;
@@ -106,6 +112,13 @@ const navItems = [
 const viewerInfoStorageKey = "sjodinPhotos.viewer.showInfo";
 const LONG_PRESS_MS = 500;
 const LONG_PRESS_MOVE_TOLERANCE = 10;
+const MAX_DESCRIPTION_LENGTH = 2000;
+// Album reorder: touch needs a short hold to pick a tile up (so plain scrolling
+// still works); a mouse just drags. Near the viewport edges the page auto-scrolls.
+const REORDER_HOLD_MS = 220;
+const REORDER_DRAG_THRESHOLD = 6;
+const REORDER_SCROLL_EDGE = 72;
+const REORDER_SCROLL_MAX_SPEED = 18;
 const SWIPE_NAVIGATE_THRESHOLD = 60;
 const SWIPE_CLOSE_THRESHOLD = 90;
 
@@ -194,6 +207,7 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
   const [albumPickOpen, setAlbumPickOpen] = useState(false);
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [editAlbumOpen, setEditAlbumOpen] = useState(false);
+  const [reorderMode, setReorderMode] = useState(false);
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>([]);
   const [confirmState, setConfirmState] = useState<ConfirmRequest | null>(null);
   const [linkPrompt, setLinkPrompt] = useState<string | null>(null);
@@ -212,7 +226,7 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
     return () => clearTimeout(id);
   }, [message, busy]);
 
-  // The viewer's "Add to album" list needs albums before the Albums tab is visited.
+  // The select-mode "Add to album" picker needs albums before the Albums tab is visited.
   useEffect(() => {
     void loadAlbums();
     // Landing back from the share-target service worker flow.
@@ -241,6 +255,7 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
 
   useEffect(() => {
     clearSelect();
+    setReorderMode(false);
     if (view === "admin") return;
     if (view === "albums") {
       loadAlbums();
@@ -392,7 +407,7 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
     }
   }
 
-  async function mutateAsset(asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) {
+  async function mutateAsset(asset: Asset, patch: AssetPatch) {
     const data = await api<{ asset: Asset }>(`/api/assets/${asset.id}`, {
       method: "PATCH",
       body: JSON.stringify(patch)
@@ -548,6 +563,25 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
         onCancel: () => resolve()
       });
     });
+  }
+
+  /** Applies a drag-and-drop order optimistically, then persists it; reloads on failure. */
+  async function reorderAlbum(assetIds: string[]) {
+    const albumId = activeAlbumIdRef.current;
+    if (!albumId) return;
+    patchAssets((current) => {
+      const byId = new Map(current.map((asset) => [asset.id, asset]));
+      const next = assetIds.map((id) => byId.get(id)).filter((asset): asset is Asset => Boolean(asset));
+      const placed = new Set(assetIds);
+      return [...next, ...current.filter((asset) => !placed.has(asset.id))];
+    });
+    try {
+      await api(`/api/albums/${albumId}/order`, { method: "PUT", body: JSON.stringify({ assetIds }) });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not save the new order.");
+      albumAssetsCache.current.delete(albumId);
+      await loadAlbumAssets(albumId);
+    }
   }
 
   async function setCoverPhoto(albumId: string, assetId: string) {
@@ -791,6 +825,8 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
           <AdminPanel currentUser={user} />
         ) : view === "albums" && !activeAlbum ? (
           <AlbumsView albums={albums} onCreate={createAlbum} onOpen={setActiveAlbum} onShare={shareAlbum} />
+        ) : activeAlbum && reorderMode ? (
+          <ReorderView assets={assets} onDone={() => setReorderMode(false)} onReorder={reorderAlbum} />
         ) : (
           <DropArea dragging={dragging} hint={uploadHint} onDragChange={setDragging} onDrop={handleDrop}>
             <LibraryView
@@ -802,6 +838,7 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
               onAddExisting={openAddModal}
               onBack={() => setActiveAlbum(null)}
               onEditAlbum={() => setEditAlbumOpen(true)}
+              onReorder={activeAlbum ? () => { clearSelect(); setReorderMode(true); } : undefined}
               onSelect={setSelected}
               onSetCover={activeAlbum ? setCoverPhoto : undefined}
               onShare={shareAlbum}
@@ -893,10 +930,8 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
       {selected && (
         <Viewer
           activeAlbum={activeAlbum}
-          albums={albums}
           asset={selected}
           assets={visibleAssets}
-          onAddToAlbum={addToAlbum}
           onClose={() => setSelected(null)}
           onDelete={deleteAsset}
           onMutate={mutateAsset}
@@ -1461,55 +1496,60 @@ function ViewerStage({
   return (
     <Overlay>
       <div aria-modal="true" className={infoOpen ? "viewer info-open" : "viewer"} role="dialog">
-        <div
-          className={isVideo ? "viewer-stage is-video" : "viewer-stage"}
-          onClick={(event) => {
-            if (justSwiped.current) {
-              justSwiped.current = false;
-              return;
-            }
-            if (event.target === event.currentTarget) onClose();
-          }}
-          onPointerCancel={handlePointerEnd}
-          onPointerDown={handlePointerDown}
-          onPointerLeave={handlePointerEnd}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerEnd}
-        >
-          <div className="viewer-topbar">
-            <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
-            <div className="viewer-actions">
-              {actions}
+        <div className="viewer-main">
+          <div
+            className={isVideo ? "viewer-stage is-video" : "viewer-stage"}
+            onClick={(event) => {
+              if (justSwiped.current) {
+                justSwiped.current = false;
+                return;
+              }
+              if (event.target === event.currentTarget) onClose();
+            }}
+            onPointerCancel={handlePointerEnd}
+            onPointerDown={handlePointerDown}
+            onPointerLeave={handlePointerEnd}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerEnd}
+          >
+            <div className="viewer-topbar">
+              <button className="icon-button light" onClick={onClose} title="Close" type="button"><X size={20} /></button>
+              <div className="viewer-actions">
+                {actions}
+              </div>
             </div>
+            {previous && (
+              <button className="viewer-nav previous" onClick={() => onSelect(previous)} title="Previous" type="button">
+                <ChevronLeft size={28} />
+              </button>
+            )}
+            {isVideo ? (
+              <VideoPlayer asset={asset} key={asset.id} />
+            ) : (
+              <>
+                {!loaded && (
+                  <img alt="" aria-hidden className="viewer-backdrop" draggable={false} key={`backdrop-${asset.id}`} src={asset.urls.thumb} />
+                )}
+                <img
+                  alt={asset.originalName}
+                  className={loaded ? "viewer-image" : "viewer-image loading"}
+                  draggable={false}
+                  key={asset.id}
+                  onDoubleClick={(event) => toggleZoom(event.clientX, event.clientY)}
+                  onLoad={() => setLoadedId(asset.id)}
+                  ref={imgRef}
+                  src={asset.urls.preview}
+                />
+              </>
+            )}
+            {next && (
+              <button className="viewer-nav next" onClick={() => onSelect(next)} title="Next" type="button">
+                <ChevronRight size={28} />
+              </button>
+            )}
           </div>
-          {previous && (
-            <button className="viewer-nav previous" onClick={() => onSelect(previous)} title="Previous" type="button">
-              <ChevronLeft size={28} />
-            </button>
-          )}
-          {isVideo ? (
-            <VideoPlayer asset={asset} key={asset.id} />
-          ) : (
-            <>
-              {!loaded && (
-                <img alt="" aria-hidden className="viewer-backdrop" draggable={false} key={`backdrop-${asset.id}`} src={asset.urls.thumb} />
-              )}
-              <img
-                alt={asset.originalName}
-                className={loaded ? "viewer-image" : "viewer-image loading"}
-                draggable={false}
-                key={asset.id}
-                onDoubleClick={(event) => toggleZoom(event.clientX, event.clientY)}
-                onLoad={() => setLoadedId(asset.id)}
-                ref={imgRef}
-                src={asset.urls.preview}
-              />
-            </>
-          )}
-          {next && (
-            <button className="viewer-nav next" onClick={() => onSelect(next)} title="Next" type="button">
-              <ChevronRight size={28} />
-            </button>
+          {asset.description && (
+            <p className="viewer-caption" key={asset.id}>{asset.description}</p>
           )}
         </div>
         {panel}
@@ -2213,10 +2253,8 @@ function SharedViewer({
 
 function Viewer({
   activeAlbum,
-  albums,
   asset,
   assets,
-  onAddToAlbum,
   onClose,
   onDelete,
   onMutate,
@@ -2224,13 +2262,11 @@ function Viewer({
   onSetCover
 }: {
   activeAlbum: Album | null;
-  albums: Album[];
   asset: Asset;
   assets: Asset[];
-  onAddToAlbum: (albumId: string, assetId: string) => Promise<void>;
   onClose: () => void;
   onDelete: (asset: Asset) => Promise<void>;
-  onMutate: (asset: Asset, patch: Partial<Pick<Asset, "favorite" | "archived" | "trashed">>) => Promise<void>;
+  onMutate: (asset: Asset, patch: AssetPatch) => Promise<void>;
   onSelect: (asset: Asset) => void;
   onSetCover: (albumId: string, assetId: string) => Promise<void>;
 }) {
@@ -2269,6 +2305,11 @@ function Viewer({
         ) : null}
         <div><dt>Type</dt><dd>{asset.mimeType}</dd></div>
       </dl>
+      <DescriptionEditor
+        key={asset.id}
+        onSave={(description) => onMutate(asset, { description })}
+        value={asset.description}
+      />
       <div className="info-actions">
         {asset.urls.original && (
           <a className="secondary-button" href={asset.urls.original} target="_blank" rel="noreferrer">Download</a>
@@ -2282,14 +2323,6 @@ function Viewer({
           <button className="secondary-button" onClick={() => void onMutate(asset, { trashed: true })} type="button">Move to trash</button>
         )}
       </div>
-      {!!albums.length && (
-        <div className="album-pick">
-          <span>Add to album</span>
-          {albums.map((album) => (
-            <button key={album.id} onClick={() => void onAddToAlbum(album.id, asset.id)} type="button">{album.title}</button>
-          ))}
-        </div>
-      )}
     </aside>
   ) : undefined;
 
@@ -2315,6 +2348,7 @@ function LibraryView({
   onAddExisting,
   onBack,
   onEditAlbum = () => {},
+  onReorder,
   onSelect,
   onSetCover,
   onShare,
@@ -2334,6 +2368,8 @@ function LibraryView({
   onAddExisting: () => void;
   onBack: () => void;
   onEditAlbum?: () => void;
+  /** Enters drag-and-drop reorder mode (albums only). */
+  onReorder?: () => void;
   onSelect: (asset: Asset) => void;
   onSetCover?: (albumId: string, assetId: string) => Promise<void>;
   onShare: (album: Album) => Promise<void>;
@@ -2396,7 +2432,7 @@ function LibraryView({
     return (
       <section className="empty-state">
         {activeAlbum && (
-          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
+          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onReorder={onReorder} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
         )}
         <div className="empty-icon"><Images size={38} /></div>
         <h2>No items here</h2>
@@ -2413,7 +2449,7 @@ function LibraryView({
     <>
       <section className="library">
         {activeAlbum && (
-          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
+          <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onReorder={onReorder} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
         )}
         {(groupByDate ? groupAssets(assets) : [{ label: "", assets }]).map((group) => (
           <div className="date-group" key={group.label}>
@@ -2431,6 +2467,7 @@ function LibraryView({
                     onPointerMove={handlePointerMove}
                     onPointerCancel={cancelPress}
                     onContextMenu={(e) => e.preventDefault()}
+                    title={asset.description || undefined}
                     type="button"
                   >
                     <img src={asset.urls.thumb} alt={asset.originalName} loading="lazy" draggable={false} />
@@ -2512,6 +2549,7 @@ function AlbumActionBar({
   onAddExisting,
   onBack,
   onEdit,
+  onReorder,
   onShare,
   onUnshare,
   onUpload
@@ -2520,6 +2558,7 @@ function AlbumActionBar({
   onAddExisting: () => void;
   onBack: () => void;
   onEdit: () => void;
+  onReorder?: () => void;
   onShare: (album: Album) => Promise<void>;
   onUnshare?: (album: Album) => Promise<void>;
   onUpload: () => void;
@@ -2534,6 +2573,12 @@ function AlbumActionBar({
           <Pencil size={18} />
           <span>Edit</span>
         </button>
+        {onReorder && album.assetCount > 1 && (
+          <button className="secondary-button" onClick={onReorder} type="button">
+            <ArrowUpDown size={18} />
+            <span>Reorder</span>
+          </button>
+        )}
         <button className="secondary-button" onClick={onAddExisting} type="button">
           <Images size={18} />
           <span>Add existing</span>
@@ -2554,6 +2599,312 @@ function AlbumActionBar({
         </button>
       </div>
     </div>
+  );
+}
+
+/**
+ * Caption editor in the viewer's info panel. Keeps a local draft so typing
+ * never round-trips through the server; Save (or Ctrl/⌘+Enter) persists it.
+ */
+function DescriptionEditor({ onSave, value }: { onSave: (description: string) => Promise<void>; value: string }) {
+  const [draft, setDraft] = useState(value);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const id = useId();
+  const dirty = draft.trim() !== value;
+
+  async function save() {
+    if (!dirty || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onSave(draft.trim());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the description.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="description-editor">
+      <label htmlFor={id}>Description</label>
+      <textarea
+        id={id}
+        maxLength={MAX_DESCRIPTION_LENGTH}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault();
+            void save();
+          }
+        }}
+        placeholder="Add a description… it shows under the photo, also in shared albums."
+        rows={3}
+        value={draft}
+      />
+      {(dirty || error) && (
+        <div className="description-editor-actions">
+          {error && <span className="description-editor-error">{error}</span>}
+          <button className="text-button" disabled={saving} onClick={() => { setDraft(value); setError(""); }} type="button">Cancel</button>
+          <button className="primary-button" disabled={saving || !dirty} onClick={() => void save()} type="button">
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Album reorder mode: replaces the grid with a drag-and-drop sortable one. */
+function ReorderView({ assets, onDone, onReorder }: {
+  assets: Asset[];
+  onDone: () => void;
+  onReorder: (assetIds: string[]) => Promise<void>;
+}) {
+  const coarse = useMemo(() => window.matchMedia("(pointer: coarse)").matches, []);
+  return (
+    <section className="library">
+      <div className="album-actions reorder-actions">
+        <p className="reorder-hint">
+          <ArrowUpDown size={18} />
+          <span>{coarse ? "Press and hold a photo, then drag it to a new spot." : "Drag photos to change their order."}</span>
+        </p>
+        <div>
+          <button className="primary-button" onClick={onDone} type="button">
+            <Check size={18} />
+            <span>Done</span>
+          </button>
+        </div>
+      </div>
+      <ReorderGrid assets={assets} onReorder={onReorder} />
+    </section>
+  );
+}
+
+type ReorderDrag = {
+  id: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  active: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
+  ghost: { width: number; height: number; offsetX: number; offsetY: number };
+};
+
+/**
+ * Pointer-event sortable grid (works for mouse, pen and touch, unlike HTML5
+ * drag-and-drop). The dragged tile stays in the grid as a faded placeholder
+ * while a fixed-position ghost follows the pointer; hovering another slot
+ * moves the placeholder there, and releasing persists the new order.
+ */
+function ReorderGrid({ assets, onReorder }: { assets: Asset[]; onReorder: (assetIds: string[]) => Promise<void> }) {
+  const [order, setOrder] = useState(assets);
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [ghost, setGhost] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const drag = useRef<ReorderDrag | null>(null);
+  const orderRef = useRef(order);
+  orderRef.current = order;
+  const pointer = useRef({ x: 0, y: 0 });
+  const scrollFrame = useRef<number | null>(null);
+
+  // Adopt the parent's list when it changes (poll/refetch), but never mid-drag.
+  useEffect(() => {
+    if (!drag.current?.active) setOrder(assets);
+  }, [assets]);
+
+  // React registers touchmove as passive, so scroll prevention while dragging
+  // needs a native non-passive listener.
+  useEffect(() => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    const block = (event: TouchEvent) => {
+      if (drag.current?.active) event.preventDefault();
+    };
+    grid.addEventListener("touchmove", block, { passive: false });
+    return () => grid.removeEventListener("touchmove", block);
+  }, []);
+
+  useEffect(() => () => stopAutoScroll(), []);
+
+  function stopAutoScroll() {
+    if (scrollFrame.current !== null) {
+      cancelAnimationFrame(scrollFrame.current);
+      scrollFrame.current = null;
+    }
+  }
+
+  /** Scrolls the page while the pointer sits near the top/bottom edge. */
+  function autoScrollTick() {
+    scrollFrame.current = null;
+    if (!drag.current?.active) return;
+    const { y } = pointer.current;
+    const height = window.innerHeight;
+    let speed = 0;
+    if (y < REORDER_SCROLL_EDGE) speed = -Math.ceil(((REORDER_SCROLL_EDGE - y) / REORDER_SCROLL_EDGE) * REORDER_SCROLL_MAX_SPEED);
+    else if (y > height - REORDER_SCROLL_EDGE) speed = Math.ceil(((y - (height - REORDER_SCROLL_EDGE)) / REORDER_SCROLL_EDGE) * REORDER_SCROLL_MAX_SPEED);
+    if (speed !== 0) {
+      window.scrollBy(0, speed);
+      updateHover();
+    }
+    scrollFrame.current = requestAnimationFrame(autoScrollTick);
+  }
+
+  /** Moves the dragged tile into whichever slot is under the pointer. */
+  function updateHover() {
+    const current = drag.current;
+    if (!current?.active) return;
+    const { x, y } = pointer.current;
+    const target = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-reorder-index]");
+    if (!target || !gridRef.current?.contains(target)) return;
+    const to = Number(target.dataset.reorderIndex);
+    const list = orderRef.current;
+    const from = list.findIndex((asset) => asset.id === current.id);
+    if (from < 0 || to === from || Number.isNaN(to)) return;
+    const next = [...list];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    orderRef.current = next;
+    setOrder(next);
+  }
+
+  function activate(element: HTMLElement) {
+    const current = drag.current;
+    if (!current || current.active) return;
+    current.active = true;
+    const rect = element.getBoundingClientRect();
+    current.ghost = {
+      width: rect.width,
+      height: rect.height,
+      offsetX: current.startX - rect.left,
+      offsetY: current.startY - rect.top
+    };
+    setDragId(current.id);
+    setGhost({ x: rect.left, y: rect.top, width: rect.width, height: rect.height });
+    navigator.vibrate?.(12);
+    if (scrollFrame.current === null) scrollFrame.current = requestAnimationFrame(autoScrollTick);
+  }
+
+  function clearDrag() {
+    const current = drag.current;
+    if (current?.timer) clearTimeout(current.timer);
+    drag.current = null;
+    stopAutoScroll();
+    setDragId(null);
+    setGhost(null);
+  }
+
+  function handlePointerDown(event: React.PointerEvent<HTMLElement>, id: string) {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    if (drag.current) clearDrag();
+    const element = event.currentTarget;
+    element.setPointerCapture(event.pointerId);
+    pointer.current = { x: event.clientX, y: event.clientY };
+    const state: ReorderDrag = {
+      id,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      timer: null,
+      ghost: { width: 0, height: 0, offsetX: 0, offsetY: 0 }
+    };
+    drag.current = state;
+    // Touch/pen: hold briefly to pick the tile up so a swipe still scrolls.
+    if (event.pointerType !== "mouse") {
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        if (drag.current === state) activate(element);
+      }, REORDER_HOLD_MS);
+    }
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLElement>) {
+    const current = drag.current;
+    if (!current || event.pointerId !== current.pointerId) return;
+    pointer.current = { x: event.clientX, y: event.clientY };
+    if (!current.active) {
+      const moved = Math.hypot(event.clientX - current.startX, event.clientY - current.startY) > REORDER_DRAG_THRESHOLD;
+      if (!moved) return;
+      if (event.pointerType === "mouse") {
+        activate(event.currentTarget);
+      } else {
+        // Moved before the hold completed: this is a scroll, not a drag.
+        clearDrag();
+        return;
+      }
+    }
+    const { offsetX, offsetY, width, height } = current.ghost;
+    setGhost({ x: event.clientX - offsetX, y: event.clientY - offsetY, width, height });
+    updateHover();
+  }
+
+  function handlePointerEnd(event: React.PointerEvent<HTMLElement>) {
+    const current = drag.current;
+    if (!current || event.pointerId !== current.pointerId) return;
+    const wasActive = current.active;
+    clearDrag();
+    if (!wasActive) return;
+    const ids = orderRef.current.map((asset) => asset.id);
+    if (ids.some((id, index) => id !== assets[index]?.id)) void onReorder(ids);
+  }
+
+  function handlePointerCancel(event: React.PointerEvent<HTMLElement>) {
+    const current = drag.current;
+    if (!current || event.pointerId !== current.pointerId) return;
+    if (current.active) setOrder(assets);
+    clearDrag();
+  }
+
+  useEffect(() => {
+    if (!dragId) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOrder(assets);
+        clearDrag();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dragId, assets]);
+
+  const ghostAsset = dragId ? order.find((asset) => asset.id === dragId) : null;
+
+  return (
+    <>
+      <div className={dragId ? "photo-grid reorder-grid is-dragging" : "photo-grid reorder-grid"} ref={gridRef}>
+        {order.map((asset, index) => (
+          <div
+            className={`photo-tile reorder-tile${asset.id === dragId ? " is-placeholder" : ""}`}
+            data-reorder-index={index}
+            key={asset.id}
+            onContextMenu={(event) => event.preventDefault()}
+            onPointerCancel={handlePointerCancel}
+            onPointerDown={(event) => handlePointerDown(event, asset.id)}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerEnd}
+            role="listitem"
+            title={asset.originalName}
+          >
+            <img alt={asset.originalName} draggable={false} loading="lazy" src={asset.urls.thumb} />
+            <VideoTileOverlay asset={asset} />
+            <span className="reorder-index">{index + 1}</span>
+          </div>
+        ))}
+      </div>
+      {ghost && ghostAsset && (
+        <Overlay>
+          <div
+            aria-hidden
+            className="reorder-ghost"
+            style={{ left: ghost.x, top: ghost.y, width: ghost.width, height: ghost.height }}
+          >
+            <img alt="" draggable={false} src={ghostAsset.urls.thumb} />
+          </div>
+        </Overlay>
+      )}
+    </>
   );
 }
 
