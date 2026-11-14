@@ -864,6 +864,35 @@ button:disabled {
   font-weight: 700;
 }
 
+.form-notice {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.field-label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.account-actions,
+.topbar-account,
+.user-row-actions,
+.empty-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.empty-actions {
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
 /* ---------- Albums ---------- */
 
 .albums-layout,
@@ -2107,11 +2136,23 @@ button:disabled {
   }
 
   .user-row {
-    grid-template-columns: minmax(0, 1fr) 120px 70px 44px;
+    grid-template-columns: minmax(0, 1fr) 120px 70px auto;
     gap: 12px;
   }
 
   .switch {
     justify-content: center;
   }
+}
+
+/* Button groups inside rows whose generic `div` rule would stack them. */
+.account-strip .account-actions,
+.user-row .user-row-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* `.confirm-modal p` would otherwise mute error text inside dialogs. */
+.confirm-modal .form-error {
+  color: #9f2b20;
 }

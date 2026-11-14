@@ -15,6 +15,7 @@ import {
   ImagePlus,
   Images,
   Info,
+  KeyRound,
   Loader,
   LogOut,
   Maximize,
@@ -129,7 +130,17 @@ type AppConfig = {
   attributionUrl: string;
   maxUploadFileSizeMb: number;
   maxUploadVideoSizeMb: number;
+  /** Days before trashed items are purged; 0 means they are kept until emptied. */
+  trashRetentionDays: number;
 };
+
+// Above this, a zip download is handed to the browser as a normal download
+// (streamed to disk) instead of being buffered in page memory first.
+const STREAM_ZIP_BYTES = 300 * 1024 * 1024;
+// The server packs at most this many items into one zip.
+const ZIP_MAX_ITEMS = 500;
+// Bulk actions send one request per item; keep only a few in flight.
+const BULK_CONCURRENCY = 6;
 
 const fallbackConfig: AppConfig = {
   appName: "Sjodin Photos",
@@ -137,7 +148,8 @@ const fallbackConfig: AppConfig = {
   attributionText: "",
   attributionUrl: "",
   maxUploadFileSizeMb: 120,
-  maxUploadVideoSizeMb: 2048
+  maxUploadVideoSizeMb: 2048,
+  trashRetentionDays: 30
 };
 
 function App() {
@@ -181,16 +193,18 @@ function App() {
       onLogout={() => setUser(null)}
       maxImageMb={config?.maxUploadFileSizeMb ?? fallbackConfig.maxUploadFileSizeMb}
       maxVideoMb={config?.maxUploadVideoSizeMb ?? fallbackConfig.maxUploadVideoSizeMb}
+      trashDays={config?.trashRetentionDays ?? fallbackConfig.trashRetentionDays}
     />
   );
 }
 
-function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
+function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb, trashDays }: {
   appName: string;
   user: User;
   onLogout: () => void;
   maxImageMb: number;
   maxVideoMb: number;
+  trashDays: number;
 }) {
   const [view, setView] = useState<View>("photos");
   const [assets, setAssets] = useState<Asset[]>([]);
@@ -211,6 +225,8 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>([]);
   const [confirmState, setConfirmState] = useState<ConfirmRequest | null>(null);
   const [linkPrompt, setLinkPrompt] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [passwordOpen, setPasswordOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement | null>(null);
   // Session cache of each album's photos: opening a cached album renders
   // instantly and a background fetch revalidates it (stale-while-revalidate).
@@ -237,6 +253,18 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
     }
   }, []);
 
+  // Safety net: many actions are fired without awaiting (`void action()`).
+  // If one fails, say so instead of silently doing nothing.
+  useEffect(() => {
+    function onUnhandled(event: PromiseRejectionEvent) {
+      event.preventDefault();
+      const reason: unknown = event.reason;
+      setMessage(reason instanceof Error && reason.message ? reason.message : "Something went wrong. Please try again.");
+    }
+    window.addEventListener("unhandledrejection", onUnhandled);
+    return () => window.removeEventListener("unhandledrejection", onUnhandled);
+  }, []);
+
   function confirmAction(request: ConfirmRequest) {
     setConfirmState(request);
   }
@@ -256,6 +284,7 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
   useEffect(() => {
     clearSelect();
     setReorderMode(false);
+    setLoadError("");
     if (view === "admin") return;
     if (view === "albums") {
       loadAlbums();
@@ -281,15 +310,25 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
     try {
       const data = await api<{ assets: Asset[] }>(`/api/assets?view=${nextView}&q=${encodeURIComponent(search)}`);
       // A slow response must not clobber an album the user has since opened.
-      if (!activeAlbumIdRef.current) setAssets(data.assets);
+      if (!activeAlbumIdRef.current) {
+        setAssets(data.assets);
+        setLoadError("");
+      }
+    } catch (error) {
+      // Shown as a retry panel — an empty grid would look like an empty library.
+      if (!activeAlbumIdRef.current) setLoadError(errorText(error, "Could not load your photos."));
     } finally {
       setBusy(false);
     }
   }
 
   async function loadAlbums() {
-    const data = await api<{ albums: Album[] }>("/api/albums");
-    setAlbums(data.albums);
+    try {
+      const data = await api<{ albums: Album[] }>("/api/albums");
+      setAlbums(data.albums);
+    } catch (error) {
+      setMessage(errorText(error, "Could not load albums."));
+    }
   }
 
   async function loadAlbumAssets(albumId: string) {
@@ -305,10 +344,21 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
     try {
       const data = await api<{ assets: Asset[] }>(`/api/albums/${albumId}/assets`);
       albumAssetsCache.current.set(albumId, data.assets);
-      if (activeAlbumIdRef.current === albumId) setAssets(data.assets);
+      if (activeAlbumIdRef.current === albumId) {
+        setAssets(data.assets);
+        setLoadError("");
+      }
+    } catch (error) {
+      if (activeAlbumIdRef.current === albumId) setLoadError(errorText(error, "Could not load this album."));
     } finally {
       if (!cached) setBusy(false);
     }
+  }
+
+  function retryLoad() {
+    setLoadError("");
+    if (activeAlbum) void loadAlbumAssets(activeAlbum.id);
+    else void loadAssets(view);
   }
 
   /** Silent refetch (no busy spinner) used to poll transcoding videos to ready. */
@@ -619,15 +669,13 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
     clearSelect();
     setBusy(true);
     try {
-      await Promise.all(ids.map((id) =>
+      const failed = await runLimited(ids, BULK_CONCURRENCY, (id) =>
         api(`/api/assets/${id}`, { method: "PATCH", body: JSON.stringify(patch) })
-      ));
-      setMessage(note);
+      );
+      setMessage(failed ? `${note} — ${failed} of ${ids.length} failed` : note);
       if (activeAlbum) await loadAlbumAssets(activeAlbum.id);
       else await loadAssets(view);
       void loadAlbums();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Something went wrong.");
     } finally {
       setBusy(false);
     }
@@ -645,11 +693,12 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
       danger: true,
       onConfirm: async () => {
         clearSelect();
-        await Promise.all(ids.map((id) => api(`/api/assets/${id}`, { method: "DELETE" })));
+        const failed = await runLimited(ids, BULK_CONCURRENCY, (id) => api(`/api/assets/${id}`, { method: "DELETE" }));
         // Permanently deleted photos may sit in cached albums too.
         albumAssetsCache.current.clear();
         await loadAssets(view);
         void loadAlbums();
+        if (failed) throw new Error(`${failed} of ${ids.length} items could not be deleted.`);
       }
     });
   }
@@ -657,6 +706,30 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
   async function bulkDownload() {
     const ids = [...selectedIds];
     if (!ids.length) return;
+    if (ids.length > ZIP_MAX_ITEMS) {
+      setMessage(`Select up to ${ZIP_MAX_ITEMS} items per download (${ids.length} selected).`);
+      return;
+    }
+    const totalBytes = assets.reduce((sum, asset) => selectedIds.has(asset.id) ? sum + asset.sizeBytes : sum, 0);
+    if (totalBytes > STREAM_ZIP_BYTES) {
+      // Too big to hold in memory: post a plain form so the browser saves the
+      // zip straight to disk as a regular download.
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = "/api/assets/zip";
+      form.style.display = "none";
+      const field = document.createElement("input");
+      field.type = "hidden";
+      field.name = "assetIds";
+      field.value = JSON.stringify(ids);
+      form.append(field);
+      document.body.append(form);
+      form.submit();
+      form.remove();
+      setMessage(`Download started (${formatBytes(totalBytes)})`);
+      clearSelect();
+      return;
+    }
     setMessage("Preparing download");
     try {
       const response = await fetch("/api/assets/zip", {
@@ -751,9 +824,14 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
             <strong>{user.name}</strong>
             <span>{user.email}</span>
           </div>
-          <button className="icon-button" onClick={logout} title="Log out" type="button">
-            <LogOut size={18} />
-          </button>
+          <div className="account-actions">
+            <button className="icon-button" onClick={() => setPasswordOpen(true)} title="Change password" type="button">
+              <KeyRound size={18} />
+            </button>
+            <button className="icon-button" onClick={logout} title="Log out" type="button">
+              <LogOut size={18} />
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -761,14 +839,19 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
         <header className="topbar">
           <div className="topbar-heading">
             <div>
-              {showLibraryTools && (
+              {showLibraryTools && !loadError && (
                 <p className="eyebrow">{visibleAssets.length} item{visibleAssets.length === 1 ? "" : "s"}</p>
               )}
               <h1>{title}</h1>
             </div>
-            <button className="icon-button mobile-only" onClick={logout} title="Log out" type="button">
-              <LogOut size={20} />
-            </button>
+            <div className="topbar-account mobile-only">
+              <button className="icon-button" onClick={() => setPasswordOpen(true)} title="Change password" type="button">
+                <KeyRound size={20} />
+              </button>
+              <button className="icon-button" onClick={logout} title="Log out" type="button">
+                <LogOut size={20} />
+              </button>
+            </div>
           </div>
           <div className="toolbar">
             {showLibraryTools && (
@@ -784,7 +867,7 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
                 />
               </label>
             )}
-            {showLibraryTools && visibleAssets.length > 0 && (
+            {showLibraryTools && !loadError && visibleAssets.length > 0 && (
               <button
                 className="secondary-button"
                 onClick={() => selectMode ? clearSelect() : setSelectMode(true)}
@@ -812,7 +895,11 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
 
         {view === "trash" && (
           <div className="view-note trash-note">
-            <p>Photos in the trash are deleted permanently after 30 days.</p>
+            <p>
+              {trashDays > 0
+                ? `Items in the trash are deleted permanently after ${trashDays} day${trashDays === 1 ? "" : "s"}.`
+                : "Items stay in the trash until you empty it."}
+            </p>
             {assets.length > 0 && (
               <button className="danger-button" onClick={emptyTrash} type="button">
                 <Trash2 size={16} />
@@ -825,6 +912,21 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
           <AdminPanel currentUser={user} />
         ) : view === "albums" && !activeAlbum ? (
           <AlbumsView albums={albums} onCreate={createAlbum} onOpen={setActiveAlbum} onShare={shareAlbum} />
+        ) : loadError ? (
+          <section className="empty-state" role="alert">
+            <div className="empty-icon"><AlertTriangle size={38} /></div>
+            <h2>Couldn't load {activeAlbum ? "this album" : "your photos"}</h2>
+            <p className="upload-hint">{loadError}</p>
+            <div className="empty-actions">
+              {activeAlbum && (
+                <button className="secondary-button" onClick={() => setActiveAlbum(null)} type="button">Back to albums</button>
+              )}
+              <button className="primary-button" onClick={retryLoad} type="button">
+                <RotateCcw size={18} />
+                <span>Try again</span>
+              </button>
+            </div>
+          </section>
         ) : activeAlbum && reorderMode ? (
           <ReorderView assets={assets} onDone={() => setReorderMode(false)} onReorder={reorderAlbum} />
         ) : (
@@ -942,6 +1044,21 @@ function PhotosApp({ appName, user, onLogout, maxImageMb, maxVideoMb }: {
 
       {confirmState && (
         <ConfirmDialog request={confirmState} onClose={() => setConfirmState(null)} />
+      )}
+      {passwordOpen && (
+        <PasswordModal
+          title="Change password"
+          note="You'll stay signed in here; other devices are signed out."
+          requireCurrent
+          onClose={() => setPasswordOpen(false)}
+          onSubmit={async ({ current, next }) => {
+            await api("/api/auth/password", {
+              method: "POST",
+              body: JSON.stringify({ currentPassword: current, newPassword: next })
+            });
+            setMessage("Password changed");
+          }}
+        />
       )}
       {linkPrompt && (
         <LinkPrompt url={linkPrompt} onClose={() => setLinkPrompt(null)} />
@@ -1101,6 +1218,79 @@ function ConfirmDialog({ request, onClose }: { request: ConfirmRequest; onClose:
             </button>
           </div>
         </section>
+      </div>
+    </Overlay>
+  );
+}
+
+const MIN_PASSWORD_LENGTH = 10;
+
+/** Set-a-password dialog, used for the self-service change and the admin reset. */
+function PasswordModal({ title, note, requireCurrent = false, onClose, onSubmit }: {
+  title: string;
+  note?: string;
+  requireCurrent?: boolean;
+  onClose: () => void;
+  onSubmit: (values: { current: string; next: string }) => Promise<void>;
+}) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [repeat, setRepeat] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  useBodyScrollLock();
+  useBackClose(true, onClose);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (next.length < MIN_PASSWORD_LENGTH) {
+      setError(`Use at least ${MIN_PASSWORD_LENGTH} characters.`);
+      return;
+    }
+    if (next !== repeat) {
+      setError("The two new passwords don't match.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await onSubmit({ current, next });
+      onClose();
+    } catch (err) {
+      setError(errorText(err, "Could not change the password."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Overlay>
+      <div className="modal-backdrop" onClick={() => { if (!busy) onClose(); }}>
+        <form className="modal confirm-modal" onClick={(event) => event.stopPropagation()} onSubmit={submit}>
+          <div className="modal-head">
+            <h2>{title}</h2>
+          </div>
+          {note && <p>{note}</p>}
+          {requireCurrent && (
+            <label className="field-label">
+              Current password
+              <input autoComplete="current-password" autoFocus onChange={(event) => setCurrent(event.target.value)} required type="password" value={current} />
+            </label>
+          )}
+          <label className="field-label">
+            New password
+            <input autoComplete="new-password" autoFocus={!requireCurrent} minLength={MIN_PASSWORD_LENGTH} onChange={(event) => setNext(event.target.value)} required type="password" value={next} />
+          </label>
+          <label className="field-label">
+            Repeat new password
+            <input autoComplete="new-password" onChange={(event) => setRepeat(event.target.value)} required type="password" value={repeat} />
+          </label>
+          {error && <p className="form-error">{error}</p>}
+          <div className="modal-actions">
+            <button className="secondary-button" disabled={busy} onClick={onClose} type="button">Cancel</button>
+            <button className="primary-button" disabled={busy} type="submit">{busy ? "Saving" : "Save password"}</button>
+          </div>
+        </form>
       </div>
     </Overlay>
   );
@@ -2383,6 +2573,10 @@ function LibraryView({
 }) {
   const press = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
   const longPressFired = useRef(false);
+  const groups = useMemo(
+    () => (groupByDate ? groupAssets(assets) : [{ label: "", assets }]),
+    [assets, groupByDate]
+  );
 
   function cancelPress() {
     if (press.current) {
@@ -2451,7 +2645,7 @@ function LibraryView({
         {activeAlbum && (
           <AlbumActionBar album={activeAlbum} onAddExisting={onAddExisting} onBack={onBack} onEdit={onEditAlbum} onReorder={onReorder} onShare={onShare} onUnshare={onUnshare} onUpload={onUpload} />
         )}
-        {(groupByDate ? groupAssets(assets) : [{ label: "", assets }]).map((group) => (
+        {groups.map((group) => (
           <div className="date-group" key={group.label}>
             {group.label && <h2>{group.label}</h2>}
             <div className="photo-grid">
@@ -3155,14 +3349,20 @@ function AdminPanel({ currentUser }: { currentUser: User }) {
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<Role>("user");
   const [error, setError] = useState("");
+  const [resetUser, setResetUser] = useState<User | null>(null);
+  const [notice, setNotice] = useState("");
 
   useEffect(() => {
     void loadUsers();
   }, []);
 
   async function loadUsers() {
-    const data = await api<{ users: User[] }>("/api/admin/users");
-    setUsers(data.users);
+    try {
+      const data = await api<{ users: User[] }>("/api/admin/users");
+      setUsers(data.users);
+    } catch (err) {
+      setError(errorText(err, "Could not load users."));
+    }
   }
 
   async function createUser(event: React.FormEvent) {
@@ -3255,13 +3455,30 @@ function AdminPanel({ currentUser }: { currentUser: User }) {
                 />
                 <span />
               </label>
-              <button className="icon-button" disabled={user.id === currentUser.id} onClick={() => void deleteUser(user)} title="Delete" type="button">
-                <Trash2 size={18} />
-              </button>
+              <div className="user-row-actions">
+                <button className="icon-button" onClick={() => { setNotice(""); setResetUser(user); }} title="Reset password" type="button">
+                  <KeyRound size={18} />
+                </button>
+                <button className="icon-button" disabled={user.id === currentUser.id} onClick={() => void deleteUser(user)} title="Delete" type="button">
+                  <Trash2 size={18} />
+                </button>
+              </div>
             </div>
           ))}
         </div>
+        {notice && <p className="form-notice" role="status">{notice}</p>}
       </div>
+      {resetUser && (
+        <PasswordModal
+          title={`Reset password for ${resetUser.name}`}
+          note={`${resetUser.email} will be signed out on all devices and must use the new password.`}
+          onClose={() => setResetUser(null)}
+          onSubmit={async ({ next }) => {
+            await api(`/api/admin/users/${resetUser.id}`, { method: "PATCH", body: JSON.stringify({ password: next }) });
+            setNotice(`Password reset for ${resetUser.email}.`);
+          }}
+        />
+      )}
     </section>
   );
 }
@@ -3331,13 +3548,19 @@ function uploadWithProgress(url: string, form: FormData, onProgress: (loadedByte
 }
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {})
-    }
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers ?? {})
+      }
+    });
+  } catch {
+    // fetch only rejects when the request never got an answer.
+    throw new Error("Can't reach the server. Check your connection and try again.");
+  }
   if (!response.ok) {
     if (response.status === 401 && url !== "/api/me" && !url.startsWith("/api/auth/")) {
       // Session expired while the app was open — reload lands on the login screen.
@@ -3355,17 +3578,45 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function errorText(error: unknown, fallback: string) {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
+/** Runs `task` over `items` with at most `limit` in flight; resolves to the number that failed. */
+async function runLimited<T>(items: T[], limit: number, task: (item: T) => Promise<unknown>): Promise<number> {
+  let cursor = 0;
+  let failed = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const item = items[cursor++];
+      try {
+        await task(item);
+      } catch {
+        failed += 1;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return failed;
+}
+
 function groupAssets(assets: Asset[]) {
   const groups = new Map<string, Asset[]>();
   for (const asset of assets) {
     const label = prettyDate(asset.takenAt);
-    groups.set(label, [...(groups.get(label) ?? []), asset]);
+    const group = groups.get(label);
+    if (group) group.push(asset);
+    else groups.set(label, [asset]);
   }
   return Array.from(groups, ([label, groupAssets]) => ({ label, assets: groupAssets }));
 }
 
+// Constructing a formatter is expensive and this runs once per photo per
+// render, so share one instance.
+const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+
 function prettyDate(value: string) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
+  return dateFormatter.format(new Date(value));
 }
 
 function formatMb(mb: number) {
