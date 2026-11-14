@@ -1,23 +1,29 @@
-# Sjodin Photos — self-hosted photo and video library
+# Photos by Mats — self-hosted photo and video gallery
 
-[![CI](https://github.com/matssjodin/photos.matssjodin.com/actions/workflows/ci.yml/badge.svg)](https://github.com/matssjodin/photos.matssjodin.com/actions/workflows/ci.yml)
+[![CI](https://github.com/matssjodin/photos-by-mats/actions/workflows/ci.yml/badge.svg)](https://github.com/matssjodin/photos-by-mats/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Sjodin Photos is a lightweight, self-hosted alternative to Google Photos**: a private photo and video gallery for you and your family that runs as a single Docker container. There is no separate database server and no cloud account — just an embedded SQLite database and files on your own disk.
+**Photos by Mats is a free, open-source, self-hosted alternative to Google Photos and iCloud Photos.** It is a private photo and video library for you and your family that runs as a single Docker container on your own server, VPS, NAS, or home lab. There is no separate database server and no cloud account — just an embedded SQLite database and files on your own disk.
 
-Upload from your phone or computer, organise photos into albums, share an album with a public link, and stream videos — all from a mobile-first web app you can install on your home screen (PWA).
+- **Upload** photos and videos from your phone or computer
+- **Organise** them into albums, favorites, and an archive
+- **Share** an album with anyone through a private link — no account needed
+- **Stream** videos with adaptive quality (HLS)
+- **Install** it on your home screen as a mobile web app (PWA)
 
-The product name is configurable, so it also works as a **white-label photo gallery** for a club, studio, or client (see [White-label branding](#white-label-branding)).
+The product name is configurable, so it also works as a **white-label photo gallery** for a club, photographer, studio, or client (see [White-label branding](#white-label-branding)).
 
-![Sjodin Photos library view on desktop: sidebar with Photos, Favorites, Albums, Archive and Trash, and a photo grid grouped by date](docs/screenshots/library-desktop.png)
+![Photos by Mats library view on desktop: sidebar with Photos, Favorites, Albums, Archive and Trash, and a photo grid grouped by date](docs/screenshots/library-desktop.png)
 
 <p>
-  <img src="docs/screenshots/album-mobile.png" alt="Album view on a phone with Edit, Reorder, Add existing, Upload here and Create share link buttons above the photo grid" width="260">
+  <img src="docs/screenshots/album-mobile.png" alt="Photos by Mats album view on a phone with Edit, Reorder, Add existing, Upload here and Create share link buttons above the photo grid" width="260">
 </p>
 
 *Screenshots use generated placeholder images.*
 
 ## Contents
 
+- [Why Photos by Mats](#why-photos-by-mats)
 - [Who it is for](#who-it-is-for)
 - [Quick start with Docker](#quick-start-with-docker)
 - [Features](#features)
@@ -27,7 +33,18 @@ The product name is configurable, so it also works as a **white-label photo gall
 - [Deployment](#deployment)
 - [Storage model](#storage-model)
 - [Backups](#backups)
+- [How it compares](#how-it-compares)
 - [FAQ](#faq)
+- [License](#license)
+
+## Why Photos by Mats
+
+- **Your photos stay on your hardware.** Nothing is sent to a third party, and there is no tracking or analytics.
+- **Simple to run.** One container, one data folder, no external database. Backing up means copying one folder.
+- **Small storage footprint.** Photos become 2048 px WebP and videos become 1080p/480p H.264, so a family library fits on a modest disk.
+- **Works like an app on phones.** Installable PWA with swipe gestures, pinch-to-zoom, and Android share-sheet uploads.
+- **Sharing without accounts.** Send a link; the recipient sees just that album.
+- **Free and open source** under the MIT license.
 
 ## Who it is for
 
@@ -40,16 +57,16 @@ It is deliberately not a full archive tool: uploads are converted to space-effic
 ## Quick start with Docker
 
 ```bash
-git clone https://github.com/matssjodin/photos.matssjodin.com.git
-cd photos.matssjodin.com
-docker build -t sjodin-photos .
+git clone https://github.com/matssjodin/photos-by-mats.git
+cd photos-by-mats
+docker build -t photos-by-mats .
 
-docker run -d --name sjodin-photos \
+docker run -d --name photos-by-mats \
   -p 4000:4000 \
-  -v sjodin-photos-data:/app/data \
+  -v photos-by-mats-data:/app/data \
   -e ADMIN_EMAIL=you@example.com \
   -e ADMIN_PASSWORD='choose-a-long-password' \
-  sjodin-photos
+  photos-by-mats
 ```
 
 Open <http://localhost:4000> and sign in with the admin email and password you set. Add more users from the **Admin** screen.
@@ -198,7 +215,7 @@ ADMIN_EMAIL=<your admin email>
 ADMIN_PASSWORD=<your first admin password>
 APP_ORIGIN=https://photos.example.com
 TRUST_PROXY=1
-APP_NAME=Sjodin Photos
+APP_NAME=Photos by Mats
 APP_SHORT_NAME=Photos
 ```
 
@@ -241,9 +258,24 @@ Uploaded originals are discarded after conversion, so keep your master copies el
 
 Everything lives in `DATA_DIR`: back up that one folder (or its Docker volume) and you have the whole library. For a consistent database copy while the app is running, use `sqlite3 photos.sqlite ".backup backup.sqlite"` and copy `uploads/` alongside it. The app does not make backups for you.
 
+## How it compares
+
+Photos by Mats sits at the small, simple end of self-hosted photo software.
+
+| | Photos by Mats | Full photo suites (e.g. Immich, PhotoPrism) |
+|---|---|---|
+| Services to run | One container, embedded SQLite | Usually several (app, database, often ML workers) |
+| Keeps original files | No — converts to WebP / H.264 | Yes |
+| Face recognition, maps, RAW | No | Yes |
+| Automatic phone camera-roll sync | No (web upload, Android share sheet) | Usually, via a native app |
+| Public album links | Yes | Yes |
+| Multi-user | Yes, admin-created accounts | Yes |
+
+Choose Photos by Mats if you want a private family album that is easy to host and maintain. Choose a full suite if you need an archive of originals with search by faces and places.
+
 ## FAQ
 
-**Is this a Google Photos replacement?**
+**Is this a Google Photos alternative?**
 For browsing, albums, sharing, and phone uploads, yes. It does not have face recognition, location maps, or automatic background sync from a phone's camera roll — uploads go through the web app or the Android share sheet.
 
 **Does it keep my original files?**
@@ -261,5 +293,15 @@ There is no app-store app. The web app is an installable PWA: use "Add to Home S
 **How do shared album links work?**
 Sharing an album creates a long random link. Anyone with the link can view that album's photos and videos without logging in; nobody can list or guess other albums. Turn sharing off to invalidate the link.
 
+**Is it free?**
+Yes. It is open source under the MIT license: use it, modify it, and host it for yourself or others.
+
+**Can I rebrand it?**
+Yes. Set `APP_NAME` and the other [branding variables](#white-label-branding) and replace the icons; no code changes are needed.
+
 **What hardware does it need?**
 Any machine that runs Docker. Photo uploads are light; video transcoding is CPU-heavy, so on a small server keep `VIDEO_CONCURRENCY=1` and consider `VIDEO_PRESET=fast`.
+
+## License
+
+[MIT](LICENSE) © Mats Sjödin. Use it, modify it, and share it freely.
