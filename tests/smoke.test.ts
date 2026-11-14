@@ -111,7 +111,8 @@ test("branding config and PWA manifest reflect APP_NAME defaults", async () => {
     attributionText: "Photoalbum by Mats Sjödin",
     attributionUrl: "https://matssjodin.com",
     maxUploadFileSizeMb: 120,
-    maxUploadVideoSizeMb: 2048
+    maxUploadVideoSizeMb: 2048,
+    trashRetentionDays: 30
   });
 
   const manifest = await fetch(`${baseUrl}/manifest.webmanifest`);
@@ -681,4 +682,118 @@ test("re-uploading a trashed duplicate restores it", async () => {
   assert.equal(body.duplicates.length, 1);
   assert.equal(body.duplicates[0].id, target.id);
   assert.equal(body.duplicates[0].trashed, false);
+});
+
+test("zip download also accepts a plain form post", async () => {
+  const form = new FormData();
+  form.append("photos", new Blob([new Uint8Array(await makePng({ r: 77, g: 1, b: 140 }))], { type: "image/png" }), "zip-form.png");
+  const upload = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+  const { assets: uploaded } = await upload.json() as { assets: Array<{ id: string }> };
+  const body = new URLSearchParams({ assetIds: JSON.stringify([uploaded[0].id]) });
+  const response = await fetch(`${baseUrl}/api/assets/zip`, { method: "POST", headers: authedHeaders(), body });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/zip");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  assert.equal(String.fromCharCode(bytes[0], bytes[1]), "PK");
+});
+
+test("a missing build asset is a 404, not the SPA shell", async () => {
+  const response = await fetch(`${baseUrl}/assets/index-stale123.js`);
+  assert.equal(response.status, 404);
+  assert.ok(!(response.headers.get("content-type") ?? "").includes("text/html"));
+});
+
+test("config exposes the trash retention window", async () => {
+  const config = await (await fetch(`${baseUrl}/api/config`)).json() as { trashRetentionDays: number };
+  assert.equal(config.trashRetentionDays, 30);
+});
+
+test("login rejects non-string credentials with 400", async () => {
+  const response = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: origin },
+    body: JSON.stringify({ email: { a: 1 }, password: ["x"] })
+  });
+  assert.equal(response.status, 400);
+});
+
+test("users can change their own password; other sessions are signed out", async () => {
+  const email = "pwchange@example.com";
+  const oldPassword = "first-password-123";
+  const newPassword = "second-password-456";
+  const create = await fetch(`${baseUrl}/api/admin/users`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ email, password: oldPassword, name: "Pw" })
+  });
+  assert.equal(create.status, 201);
+
+  async function login(password: string) {
+    const response = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: origin },
+      body: JSON.stringify({ email, password })
+    });
+    return { status: response.status, cookie: (response.headers.get("set-cookie") ?? "").split(";")[0] };
+  }
+  const first = await login(oldPassword);
+  const second = await login(oldPassword);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+
+  const change = (currentPassword: string, next: string) => fetch(`${baseUrl}/api/auth/password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: origin, Cookie: first.cookie },
+    body: JSON.stringify({ currentPassword, newPassword: next })
+  });
+  assert.equal((await change("wrong-current-pw", newPassword)).status, 400);
+  assert.equal((await change(oldPassword, "short")).status, 400);
+  assert.equal((await change(oldPassword, newPassword)).status, 200);
+
+  // The session that made the change survives; the other one is revoked.
+  assert.equal((await fetch(`${baseUrl}/api/me`, { headers: { Cookie: first.cookie } })).status, 200);
+  assert.equal((await fetch(`${baseUrl}/api/me`, { headers: { Cookie: second.cookie } })).status, 401);
+  assert.equal((await login(oldPassword)).status, 401);
+  assert.equal((await login(newPassword)).status, 200);
+});
+
+test("an admin password reset signs that user out", async () => {
+  const email = "pwreset@example.com";
+  const create = await fetch(`${baseUrl}/api/admin/users`, {
+    method: "POST",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ email, password: "initial-password-1" })
+  });
+  const { user } = await create.json() as { user: { id: string } };
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: origin },
+    body: JSON.stringify({ email, password: "initial-password-1" })
+  });
+  const cookie = (login.headers.get("set-cookie") ?? "").split(";")[0];
+
+  const reset = await fetch(`${baseUrl}/api/admin/users/${user.id}`, {
+    method: "PATCH",
+    headers: authedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ password: "replaced-password-2" })
+  });
+  assert.equal(reset.status, 200);
+  assert.equal((await fetch(`${baseUrl}/api/me`, { headers: { Cookie: cookie } })).status, 401);
+  // The admin who did the reset is still signed in.
+  assert.equal((await fetch(`${baseUrl}/api/me`, { headers: authedHeaders() })).status, 200);
+});
+
+// Keep this last: it deliberately trips the lockout.
+test("login lockout cannot be dodged by spoofing X-Forwarded-For", async () => {
+  const attempt = (n: number, password: string) => fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: origin, "X-Forwarded-For": `203.0.113.${n}` },
+    body: JSON.stringify({ email: "Lockout-Target@example.com", password })
+  });
+  for (let n = 1; n <= 20; n += 1) {
+    assert.equal((await attempt(n, "wrong-password")).status, 401);
+  }
+  // A fresh spoofed address every time, yet the account is now locked.
+  assert.equal((await attempt(21, "wrong-password")).status, 429);
+  assert.equal((await attempt(22, "wrong-password")).status, 429);
 });

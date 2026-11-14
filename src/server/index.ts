@@ -33,6 +33,8 @@ const maxUploadFileSizeMb = Number(process.env.MAX_UPLOAD_FILE_SIZE_MB ?? 120);
 const maxUploadVideoSizeMb = Number(process.env.MAX_UPLOAD_VIDEO_SIZE_MB ?? 2048);
 // Per-photo caption shown in the viewer (and on shared albums).
 const maxDescriptionLength = 2000;
+const minPasswordLength = 10;
+const maxPasswordLength = 200;
 const isProduction = process.env.NODE_ENV === "production";
 const appOrigin = process.env.APP_ORIGIN?.replace(/\/$/, "");
 const ingestConcurrency = Math.max(1, Number(process.env.INGEST_CONCURRENCY ?? 3));
@@ -54,10 +56,19 @@ const appShortName = (process.env.APP_SHORT_NAME ?? "").trim() || "Photos";
 const attributionText = (process.env.ATTRIBUTION_TEXT ?? "Photoalbum by Mats Sjödin").trim();
 const attributionUrl = (process.env.ATTRIBUTION_URL ?? "https://matssjodin.com").trim();
 
+// Failed logins are counted per client IP and per target account. The
+// account counter is what stops a distributed (or IP-spoofing) guesser; its
+// threshold is higher so a few typos from the real owner never lock them out.
 const loginAttempts = new Map<string, { count: number; firstAttempt: number; lockedUntil: number }>();
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 10;
+const LOGIN_MAX_ATTEMPTS_PER_ACCOUNT = 20;
 const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+const LOGIN_ATTEMPTS_MAX_ENTRIES = 20_000;
+// Number of reverse proxies in front of the app (Express "trust proxy" hop
+// count). It decides which X-Forwarded-For entry is the client address, so it
+// must match the deployment: too high and clients can spoof their IP.
+const trustProxyHops = Math.max(0, Math.floor(Number(process.env.TRUST_PROXY ?? 1)) || 0);
 const DUMMY_HASH = crypto.pbkdf2Sync("dummy", "dummy", 310000, 32, "sha256").toString("hex");
 const DUMMY_SALT = "dummy";
 
@@ -125,7 +136,7 @@ type PublicUser = {
 };
 
 const app = express();
-app.set("trust proxy", 1);
+app.set("trust proxy", trustProxyHops);
 const upload = multer({
   dest: tempDir,
   limits: {
@@ -246,7 +257,10 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.get("/api/config", (_req, res) => {
-  res.json({ appName, appShortName, attributionText, attributionUrl, maxUploadFileSizeMb, maxUploadVideoSizeMb });
+  res.json({
+    appName, appShortName, attributionText, attributionUrl, maxUploadFileSizeMb, maxUploadVideoSizeMb,
+    trashRetentionDays: trashRetentionDays > 0 ? trashRetentionDays : 0
+  });
 });
 
 app.get("/api/share/:token", (req, res) => {
@@ -321,16 +335,17 @@ app.get("/api/share/:token/assets/:assetId/hls/:file", (req, res) => {
   sendAssetFile(res, path.join(path.dirname(asset.hls_path), file));
 });
 
-app.post("/api/auth/login", (req, res) => {
-  const ip = clientIp(req);
-  if (isLoginLocked(ip)) {
-    res.status(429).json({ error: "Too many login attempts. Please try again in a few minutes." });
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = (req.body ?? {}) as { email?: unknown; password?: unknown };
+  if (typeof email !== "string" || typeof password !== "string" || !email || !password) {
+    res.status(400).json({ error: "Email and password are required." });
     return;
   }
 
-  const { email, password } = req.body as { email?: string; password?: string };
-  if (!email || !password) {
-    res.status(400).json({ error: "Email and password are required." });
+  const ipKey = `ip:${clientIp(req)}`;
+  const accountKey = `account:${email.trim().toLowerCase().slice(0, 254)}`;
+  if (isLoginLocked(ipKey) || isLoginLocked(accountKey)) {
+    res.status(429).json({ error: "Too many login attempts. Please try again in a few minutes." });
     return;
   }
 
@@ -338,15 +353,19 @@ app.post("/api/auth/login", (req, res) => {
     .prepare("SELECT * FROM users WHERE lower(email) = lower(?)")
     .get(email.trim()) as UserRow | undefined;
 
-  const valid = user && !user.disabled && verifyPassword(password, user.salt, user.password_hash);
-  if (!valid) {
-    if (!user) verifyPassword(password, DUMMY_SALT, DUMMY_HASH);
-    recordFailedLogin(ip);
+  // Always hash (against a dummy for unknown accounts) so timing doesn't
+  // reveal which emails exist. Async so a burst of attempts can't freeze the
+  // event loop for everyone else.
+  const matches = await verifyPasswordAsync(password, user?.salt ?? DUMMY_SALT, user?.password_hash ?? DUMMY_HASH);
+  if (!user || user.disabled || !matches) {
+    recordFailedLogin(ipKey, LOGIN_MAX_ATTEMPTS);
+    recordFailedLogin(accountKey, LOGIN_MAX_ATTEMPTS_PER_ACCOUNT);
     res.status(401).json({ error: "Invalid email or password." });
     return;
   }
 
-  recordSuccessfulLogin(ip);
+  loginAttempts.delete(ipKey);
+  loginAttempts.delete(accountKey);
   const token = crypto.randomBytes(32).toString("base64url");
   const expiresAt = Date.now() + sessionTtlMs;
   db.prepare("INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
@@ -383,6 +402,39 @@ app.post("/api/auth/logout", (req, res) => {
   res.json({ ok: true });
 });
 
+// Self-service password change. Requires the current password, and signs the
+// account out everywhere except the session making the change.
+app.post("/api/auth/password", async (req, res) => {
+  const current = authUser(req);
+  const { currentPassword, newPassword } = (req.body ?? {}) as { currentPassword?: unknown; newPassword?: unknown };
+  if (typeof currentPassword !== "string" || typeof newPassword !== "string" || !currentPassword) {
+    res.status(400).json({ error: "Current and new password are required." });
+    return;
+  }
+  if (newPassword.length < minPasswordLength || newPassword.length > maxPasswordLength) {
+    res.status(400).json({ error: `New password must be ${minPasswordLength}-${maxPasswordLength} characters.` });
+    return;
+  }
+
+  const attemptKey = `password:${current.id}`;
+  if (isLoginLocked(attemptKey)) {
+    res.status(429).json({ error: "Too many attempts. Please try again in a few minutes." });
+    return;
+  }
+  const row = db.prepare("SELECT * FROM users WHERE id = ?").get(current.id) as UserRow;
+  if (!(await verifyPasswordAsync(currentPassword, row.salt, row.password_hash))) {
+    recordFailedLogin(attemptKey, LOGIN_MAX_ATTEMPTS);
+    res.status(400).json({ error: "Current password is incorrect." });
+    return;
+  }
+  loginAttempts.delete(attemptKey);
+
+  const credentials = hashPassword(newPassword);
+  db.prepare("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?").run(credentials.hash, credentials.salt, current.id);
+  db.prepare("DELETE FROM sessions WHERE user_id = ? AND token != ?").run(current.id, readSessionToken(req) ?? "");
+  res.json({ ok: true });
+});
+
 app.get("/api/admin/users", requireAdmin, (_req, res) => {
   const users = db.prepare("SELECT * FROM users ORDER BY created_at DESC").all() as UserRow[];
   res.json({ users: users.map(toPublicUser) });
@@ -396,13 +448,16 @@ app.post("/api/admin/users", requireAdmin, (req, res) => {
     role?: Role;
   };
 
-  if (!email || !password || password.length < 10) {
-    res.status(400).json({ error: "Email and a password of at least 10 characters are required." });
+  if (
+    typeof email !== "string" || typeof password !== "string" || !email.trim() ||
+    password.length < minPasswordLength || password.length > maxPasswordLength
+  ) {
+    res.status(400).json({ error: `Email and a password of at least ${minPasswordLength} characters are required.` });
     return;
   }
 
   const userRole: Role = role === "admin" ? "admin" : "user";
-  const userName = name?.trim() || email.split("@")[0];
+  const userName = (typeof name === "string" && name.trim()) || email.trim().split("@")[0];
   const credentials = hashPassword(password);
   const id = crypto.randomUUID();
 
@@ -445,15 +500,17 @@ app.patch("/api/admin/users/:id", requireAdmin, (req, res) => {
   const nextDisabled = typeof disabled === "boolean" ? Number(disabled) : existing.disabled;
 
   if (password) {
-    if (password.length < 10) {
-      res.status(400).json({ error: "Password must be at least 10 characters." });
+    if (typeof password !== "string" || password.length < minPasswordLength || password.length > maxPasswordLength) {
+      res.status(400).json({ error: `Password must be at least ${minPasswordLength} characters.` });
       return;
     }
     const credentials = hashPassword(password);
     db.prepare(`
       UPDATE users SET name = ?, role = ?, disabled = ?, password_hash = ?, salt = ? WHERE id = ?
     `).run(nextName, nextRole, nextDisabled, credentials.hash, credentials.salt, existing.id);
-    db.prepare("DELETE FROM sessions WHERE user_id = ? AND user_id != ?").run(existing.id, currentUser.id);
+    // A reset signs that account out everywhere (the admin's own current
+    // session survives when they reset their own password).
+    db.prepare("DELETE FROM sessions WHERE user_id = ? AND token != ?").run(existing.id, readSessionToken(req) ?? "");
   } else {
     db.prepare("UPDATE users SET name = ?, role = ?, disabled = ? WHERE id = ?")
       .run(nextName, nextRole, nextDisabled, existing.id);
@@ -663,9 +720,19 @@ app.post("/api/trash/empty", async (req, res) => {
   res.json({ ok: true, deleted: trashed.length });
 });
 
-app.post("/api/assets/zip", (req, res) => {
+// Accepts JSON (fetch) or a plain HTML form post whose `assetIds` field holds
+// the JSON array. The form variant lets the browser stream a large zip straight
+// to disk instead of buffering it in page memory.
+app.post("/api/assets/zip", express.urlencoded({ extended: false, limit: "1mb" }), (req, res) => {
   const user = authUser(req);
-  const { assetIds } = req.body as { assetIds?: string[] };
+  let assetIds: unknown = (req.body as { assetIds?: unknown } | undefined)?.assetIds;
+  if (typeof assetIds === "string") {
+    try {
+      assetIds = JSON.parse(assetIds);
+    } catch {
+      assetIds = [];
+    }
+  }
   const ids = Array.isArray(assetIds) ? assetIds.slice(0, 500).map(String) : [];
   const assets = ids
     .map((id) => findOwnedAsset(id, user))
@@ -1021,6 +1088,12 @@ app.get("/manifest.webmanifest", (_req, res) => {
 });
 
 app.use(express.static(clientDir));
+// Build assets are content-hashed: a miss means a stale client asking for a
+// file from an older deploy. Answer 404 rather than the SPA shell, which the
+// browser (and the service worker's cache) would otherwise store as a script.
+app.use("/assets", (_req, res) => {
+  res.status(404).type("text/plain").send("Not found");
+});
 app.get(/.*/, async (_req, res) => {
   res.sendFile(path.join(clientDir, "index.html"));
 });
@@ -1201,10 +1274,17 @@ function hashPassword(password: string) {
   return { salt, hash };
 }
 
-function verifyPassword(password: string, salt: string, hash: string) {
-  const attempted = crypto.pbkdf2Sync(password, salt, 310000, 32, "sha256");
-  const expected = Buffer.from(hash, "hex");
-  return expected.length === attempted.length && crypto.timingSafeEqual(expected, attempted);
+function verifyPasswordAsync(password: string, salt: string, hash: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, salt, 310000, 32, "sha256", (error, attempted) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      const expected = Buffer.from(hash, "hex");
+      resolve(expected.length === attempted.length && crypto.timingSafeEqual(expected, attempted));
+    });
+  });
 }
 
 function readSessionToken(req: express.Request) {
@@ -1213,41 +1293,53 @@ function readSessionToken(req: express.Request) {
   return cookie.parse(header)[sessionCookie];
 }
 
+/**
+ * The client address as seen through the trusted proxies (see TRUST_PROXY).
+ * Never read X-Forwarded-For directly: its leftmost entry is whatever the
+ * client chose to send.
+ */
 function clientIp(req: express.Request) {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.length) {
-    return forwarded.split(",")[0].trim();
-  }
-  return req.socket.remoteAddress ?? "unknown";
+  return req.ip ?? req.socket.remoteAddress ?? "unknown";
 }
 
-function isLoginLocked(ip: string) {
-  const entry = loginAttempts.get(ip);
+function isLoginLocked(key: string) {
+  const entry = loginAttempts.get(key);
   if (!entry) return false;
   const now = Date.now();
   if (entry.lockedUntil > now) return true;
-  if (now - entry.firstAttempt > LOGIN_WINDOW_MS) {
-    loginAttempts.delete(ip);
-    return false;
-  }
+  if (now - entry.firstAttempt > LOGIN_WINDOW_MS) loginAttempts.delete(key);
   return false;
 }
 
-function recordFailedLogin(ip: string) {
+function recordFailedLogin(key: string, maxAttempts: number) {
   const now = Date.now();
-  const entry = loginAttempts.get(ip);
+  const entry = loginAttempts.get(key);
   if (!entry || now - entry.firstAttempt > LOGIN_WINDOW_MS) {
-    loginAttempts.set(ip, { count: 1, firstAttempt: now, lockedUntil: 0 });
+    if (!entry && loginAttempts.size >= LOGIN_ATTEMPTS_MAX_ENTRIES) pruneLoginAttempts(true);
+    loginAttempts.set(key, { count: 1, firstAttempt: now, lockedUntil: 0 });
     return;
   }
   entry.count += 1;
-  if (entry.count >= LOGIN_MAX_ATTEMPTS) {
+  if (entry.count >= maxAttempts) {
     entry.lockedUntil = now + LOGIN_LOCKOUT_MS;
   }
 }
 
-function recordSuccessfulLogin(ip: string) {
-  loginAttempts.delete(ip);
+/**
+ * Drops counters whose window and lockout have both passed. With `makeRoom`,
+ * also evicts the oldest entries if the map is still full, so a flood of
+ * made-up emails or addresses can't grow memory without bound.
+ */
+function pruneLoginAttempts(makeRoom = false) {
+  const now = Date.now();
+  for (const [key, entry] of loginAttempts) {
+    if (entry.lockedUntil <= now && now - entry.firstAttempt > LOGIN_WINDOW_MS) loginAttempts.delete(key);
+  }
+  if (!makeRoom) return;
+  for (const key of loginAttempts.keys()) {
+    if (loginAttempts.size < LOGIN_ATTEMPTS_MAX_ENTRIES * 0.9) break;
+    loginAttempts.delete(key);
+  }
 }
 
 function securityHeaders(_req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -1337,6 +1429,7 @@ async function purgeExpiredTrash() {
 }
 
 function runMaintenance() {
+  pruneLoginAttempts();
   try {
     db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now());
   } catch (error) {
