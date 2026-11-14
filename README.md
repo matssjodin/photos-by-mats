@@ -70,6 +70,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` fo
 | `PORT` | `4000` | Server port |
 | `DATA_DIR` | `./data` | Root for the SQLite database and all photo files |
 | `APP_ORIGIN` | — | Public origin the browser hits (e.g. `https://photos.example.com`). The CSRF guard accepts requests from this origin |
+| `TRUST_PROXY` | `1` | Number of reverse proxies in front of the app (Express `trust proxy` hop count). Decides which `X-Forwarded-For` entry counts as the client IP for login rate limiting — e.g. `2` behind Cloudflare + Coolify's proxy. Too high lets clients spoof their IP |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | — | The admin account, reconciled on every startup (created, enabled, made admin, password set) |
 
 On startup the server ensures the `ADMIN_EMAIL`/`ADMIN_PASSWORD` account exists and matches. In development, if no users exist and those variables are missing, it creates `admin@example.com` / `change-me-before-deploy`. In production the server **refuses to start** with no users and no admin variables — it never creates a default account.

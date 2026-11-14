@@ -145,3 +145,19 @@ Severity: CRITICAL / HIGH / MEDIUM / LOW. Status: FIXED / BACKLOG / DECISION (ne
   + rsync of uploads). Nothing in-repo can substitute for an off-host copy.
 - **A1 pagination**: behavior-changing client+server work; not needed at current library size.
 - **U6 long-press duration**: 3 s appears deliberate; say the word and it becomes 500 ms.
+
+## Follow-up review — 2026-11-14
+
+| # | Sev | Finding | Status |
+|---|---|---|---|
+| F1 | HIGH | CI red on every push since at least 2026-06-25 (audit step); production deps had 1 critical / 9 high advisories incl. `sharp` (parses every upload), `multer`, `body-parser`, `proxy-addr`. Build toolchain shipped in the prod image via `@vitejs/plugin-react` in `dependencies`. | FIXED (3 moderate remain in `archiver`'s unused glob dependency) |
+| F2 | HIGH | Login rate limit keyed on the leftmost `X-Forwarded-For` entry (client-controlled) — trivially bypassed; `pbkdf2Sync` on the event loop let unauthenticated login floods stall the server; attempt map unbounded. Supersedes S4. | FIXED (`req.ip` + `TRUST_PROXY`, per-account counter, async hashing, pruning) |
+| F3 | HIGH | Server crash: `exifr` leaked a FileHandle per uploaded image — fatal on newer Node versions, an fd leak on Node 24. | FIXED (`readExifDate`) |
+| F4 | MEDIUM | No way to change or reset a password (forgotten password meant deleting the user and their photos); own-password change left other sessions valid. | FIXED |
+| F5 | MEDIUM | Failed loads rendered as an empty/stale library; fire-and-forget actions failed silently. | FIXED |
+| F6 | MEDIUM | Per-photo `Intl.DateTimeFormat` construction and quadratic date grouping; bulk zip buffered in page memory; bulk actions fired one request per item all at once; zip silently capped at 500. | FIXED (pagination/virtualization A1 still BACKLOG) |
+| F7 | LOW | Missing `/assets/*` served the SPA shell (cacheable as a script by the service worker); trash note hard-coded 30 days. | FIXED |
+| F8 | MEDIUM | Upload hint advertises 2 GB videos but a single request over 100 MB is rejected when proxied through Cloudflare. | DECISION |
+| F9 | LOW | ffmpeg runs on uploads with no input-format allow-list or timeout (authenticated users only). | BACKLOG |
+
+Still open for the owner: **D3 backups** (the 2048px WebP on the data volume is the only copy), **O2 non-root container**, **F8**, and setting `TRUST_PROXY` to the real proxy count in production.
