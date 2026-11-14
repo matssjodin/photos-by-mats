@@ -1432,16 +1432,7 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
       .toFile(path.join(dataDir, thumbPath));
 
     const now = new Date().toISOString();
-    let takenAt = now;
-    try {
-      const tags = await parseExif(file.path, ["DateTimeOriginal", "CreateDate"]);
-      const exifDate = tags?.DateTimeOriginal ?? tags?.CreateDate;
-      if (exifDate instanceof Date && !isNaN(exifDate.getTime())) {
-        takenAt = exifDate.toISOString();
-      }
-    } catch {
-      // no EXIF date available
-    }
+    const takenAt = (await readExifDate(file.path)) ?? now;
 
     try {
       db.prepare(`
@@ -1484,6 +1475,27 @@ async function ingestAsset(userId: string, file: Express.Multer.File): Promise<{
     await fs.rm(file.path, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+/**
+ * Capture date from the image's EXIF block, or null when there is none.
+ * sharp extracts the raw EXIF bytes and exifr parses that buffer — exifr is
+ * never handed the file path, because its file reader leaks the FileHandle
+ * (a fatal error on newer Node versions, an fd leak on older ones).
+ */
+async function readExifDate(filePath: string): Promise<string | null> {
+  try {
+    const { exif } = await sharp(filePath).metadata();
+    if (!exif) return null;
+    // The block is a TIFF structure, usually prefixed with "Exif\0\0".
+    const tiff = exif.subarray(0, 6).toString("latin1") === "Exif\0\0" ? exif.subarray(6) : exif;
+    const tags = await parseExif(tiff, ["DateTimeOriginal", "CreateDate"]);
+    const exifDate = tags?.DateTimeOriginal ?? tags?.CreateDate;
+    if (exifDate instanceof Date && !isNaN(exifDate.getTime())) return exifDate.toISOString();
+  } catch {
+    // no readable EXIF date
+  }
+  return null;
 }
 
 // The uploaded video is staged under the asset dir as this fixed name so the

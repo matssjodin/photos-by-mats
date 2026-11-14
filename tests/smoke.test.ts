@@ -20,6 +20,7 @@ let server: ChildProcess;
 let dataDir: string;
 let serverLog = "";
 let sessionCookie = "";
+let stopping = false;
 
 before(async () => {
   dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "sjodin-photos-test-"));
@@ -35,6 +36,11 @@ before(async () => {
   });
   server.stdout?.on("data", (chunk) => { serverLog += chunk; });
   server.stderr?.on("data", (chunk) => { serverLog += chunk; });
+  // A server that dies mid-run only shows up as ECONNREFUSED in later tests;
+  // print its log so the real cause is visible.
+  server.on("exit", (code) => {
+    if (!stopping) console.error(`Server exited unexpectedly (code ${code}). Log:\n${serverLog}`);
+  });
 
   const deadline = Date.now() + 30000;
   for (;;) {
@@ -52,6 +58,7 @@ before(async () => {
 });
 
 after(async () => {
+  stopping = true;
   server?.kill();
   await new Promise((resolve) => setTimeout(resolve, 500));
   await fs.rm(dataDir, { recursive: true, force: true }).catch(() => undefined);
@@ -192,6 +199,21 @@ test("image upload ingests and produces variants", async () => {
   assert.equal(thumb.status, 200);
   assert.equal(thumb.headers.get("content-type"), "image/webp");
   assert.ok(thumb.headers.get("cache-control")?.includes("immutable"));
+});
+
+test("the EXIF capture date becomes the photo's takenAt", async () => {
+  const jpeg = await sharp({ create: { width: 40, height: 30, channels: 3, background: { r: 10, g: 20, b: 30 } } })
+    .withExif({ IFD2: { DateTimeOriginal: "2019:05:06 07:08:09" } })
+    .jpeg()
+    .toBuffer();
+  const form = new FormData();
+  form.append("photos", new Blob([new Uint8Array(jpeg)], { type: "image/jpeg" }), "exif-date.jpg");
+  const response = await fetch(`${baseUrl}/api/assets`, { method: "POST", headers: authedHeaders(), body: form });
+  assert.equal(response.status, 201);
+  const body = await response.json() as { assets: Array<{ takenAt: string }> };
+  assert.equal(body.assets.length, 1);
+  // EXIF dates carry no timezone, so only the calendar year/month is asserted.
+  assert.ok(body.assets[0].takenAt.startsWith("2019-05-0"), `takenAt was ${body.assets[0].takenAt}`);
 });
 
 test("file requests for someone else's asset id return 404 shape (no IDOR leak)", async () => {
